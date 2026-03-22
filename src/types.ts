@@ -40,6 +40,21 @@ export interface Nudge {
   createdAt: string;
 }
 
+/** Project configuration — stored in SQLite, not env vars */
+export interface Config {
+  model: string;
+  maxIterations: number;
+  loopInterval: number;
+  autoPublish: boolean;
+}
+
+export const DEFAULT_CONFIG: Config = {
+  model: "@cf/moonshotai/kimi-k2.5",
+  maxIterations: 20,
+  loopInterval: 30,
+  autoPublish: true,
+};
+
 /** Overall loop state */
 export interface LoopState {
   status: "idle" | "running" | "paused" | "done";

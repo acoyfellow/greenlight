@@ -4,6 +4,7 @@
   "main": "src/index.ts",
   "compatibility_date": "2025-06-01",
   "compatibility_flags": ["nodejs_compat"],
+  "ai": { "binding": "AI" },
   "durable_objects": {
     "bindings": [
       { "name": "GREENLIGHT_DO", "class_name": "GreenlightDO" }
@@ -11,11 +12,5 @@
   },
   "migrations": [
     { "tag": "v1", "new_sqlite_classes": ["GreenlightDO"] }
-  ],
-  "vars": {
-    "GREENLIGHT_MODEL": "openrouter/moonshotai/kimi-k2.5",
-    "GREENLIGHT_MAX_ITERATIONS": "20",
-    "GREENLIGHT_LOOP_INTERVAL": "30",
-    "GREENLIGHT_AUTO_PUBLISH": "true"
-  }
+  ]
 }

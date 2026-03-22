@@ -20,7 +20,6 @@ This walks you through creating your first greenlight project. You'll add gates,
 
 - A Cloudflare account
 - Node.js 18+
-- An [OpenRouter](https://openrouter.ai) API key
 
 ### Step 1: Create a project
 
@@ -194,6 +193,7 @@ greenlight gates <name>               # List gates with status
 greenlight start <name>               # Start the loop
 greenlight pause <name>               # Pause the loop
 greenlight nudge <name> "..."         # Send a nudge
+greenlight config <name> <key> <val>  # Set a config value
 greenlight logs <name>                # Stream the log
 greenlight status <name>              # Current state
 greenlight destroy <name>             # Tear it down
@@ -265,30 +265,46 @@ ASSERTION after previous
 
 ### Configuration
 
+Config lives in the DO's SQLite — not env vars. Defaults work out of the box. Change anything at runtime:
+
+```bash
+greenlight config my-app model "@cf/moonshotai/kimi-k2.5"
+greenlight config my-app max-iterations 30
+greenlight config my-app loop-interval 15
+greenlight config my-app auto-publish false
+```
+
+| Setting | Default | Description |
+|---|---|---|
+| `model` | `@cf/moonshotai/kimi-k2.5` | Any Cloudflare Workers AI model |
+| `max-iterations` | `20` | Attempts per gate before stuck |
+| `loop-interval` | `30` | Seconds between iterations |
+| `auto-publish` | `true` | Publish live Worker when all gates pass |
+
+No env vars. No secrets. Workers AI runs on the same account you deployed to.
+
+`wrangler.jsonc` is infrastructure only:
+
 ```jsonc
-// wrangler.jsonc
 {
-  "vars": {
-    "GREENLIGHT_MODEL": "openrouter/moonshotai/kimi-k2.5",
-    "GREENLIGHT_MAX_ITERATIONS": "20",
-    "GREENLIGHT_LOOP_INTERVAL": "30",
-    "GREENLIGHT_AUTO_PUBLISH": "true"
-  }
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "greenlight",
+  "main": "src/index.ts",
+  "compatibility_date": "2025-06-01",
+  "compatibility_flags": ["nodejs_compat"],
+  "ai": { "binding": "AI" },
+  "durable_objects": {
+    "bindings": [
+      { "name": "GREENLIGHT_DO", "class_name": "GreenlightDO" }
+    ]
+  },
+  "migrations": [
+    { "tag": "v1", "new_sqlite_classes": ["GreenlightDO"] }
+  ]
 }
 ```
 
-Secrets (set via `npx wrangler secret put`):
-
-| Secret | Description |
-|---|---|
-| `GREENLIGHT_API_KEY` | OpenRouter API key (required) |
-
-| Variable | Default | Description |
-|---|---|---|
-| `GREENLIGHT_MODEL` | `moonshotai/kimi-k2.5` | Any OpenRouter model |
-| `GREENLIGHT_MAX_ITERATIONS` | `20` | Attempts per gate before stuck |
-| `GREENLIGHT_LOOP_INTERVAL` | `30` | Seconds between iterations |
-| `GREENLIGHT_AUTO_PUBLISH` | `true` | Publish live Worker when all gates pass |
+Set it once. Never touch it again.
 
 ### Architecture
 
@@ -329,72 +345,6 @@ Secrets (set via `npx wrangler secret put`):
 - **20 iterations default.** Prevents runaway spend. Nudge or raise the limit.
 - **HTTP-observable gates only.** Gates test the published surface. They can't inspect source, check types, or run static analysis.
 - **Dynamic Worker Loader is in closed beta.** Works locally with Wrangler. Production access requires Cloudflare approval.
-
----
-
-## Explanation
-
-### Gates are the spec
-
-A markdown spec is a document *about* intent. It requires interpretation. It drifts. It can say one thing while the code does another and both look plausible.
-
-A gate is intent itself. It passes or it fails. There is nothing to interpret.
-
-```
-Traditional:    spec → derive tests → build → check tests → ship
-greenlight:     gates → build → gates pass → ship
-```
-
-**If you can't express it as a gate, the agent doesn't need to know it.** If you have a preference about *how* — use CoinGecko, cache for 60 seconds — that's a nudge. Ephemeral, optional, decaying.
-
-### Nudges vs gates
-
-Natural language is not the spec. It's a hint.
-
-A nudge informs the current iteration. It helps right now and evaporates when the model no longer needs it. Gates endure. Nudges decay.
-
-The test: if it can be asserted, it's a gate. If it's a preference about implementation, it's a nudge.
-
-### Memory
-
-greenlight remembers what worked and what didn't. No vector database. No embeddings. SQLite FTS5, local to the DO, instant.
-
-Memories are created automatically when gates change state or iterations fail. The agent queries them before each attempt. Goals survive compaction. Conventions degrade. Reasoning never survives. So greenlight stores outcomes, not chains of thought.
-
-### The loop
-
-```
-     ┌──────────────────────────────────────┐
-     │          DO alarm fires               │
-     ▼                                       │
-  Query memories                             │
-     │                                       │
-  Read code from git                         │
-     │                                       │
-  Call LLM with:                             │
-  - red gates + failure messages             │
-  - relevant memories                        │
-  - active nudges                            │
-     │                                       │
-  Write files → push to git                  │
-     │                                       │
-  Publish via Dynamic Worker Loader          │
-     │                                       │
-  Run all gates against published endpoint   │
-     │                                       │
-     ├── all green → record learnings → done │
-     └── any red  → record failure ──────────┘
-```
-
-Each iteration starts fresh. The agent rehydrates by reading gates, memories, and code — not by carrying a novel. Small iterations, strong notes.
-
-### Philosophy
-
-Two things are durable: **gates** and **memories**. Everything else is liquid.
-
-The code is generated, tested, shipped, regenerated. Never precious. The model is one env var — swap it tonight. The nudges decay as models improve. The loop itself is commodity infrastructure. The gates are the product.
-
-The fix is always structural, never motivational.
 
 ## License
 

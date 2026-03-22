@@ -3,11 +3,7 @@ import type { Gate, Memory, Nudge, LoopState } from "./types.js";
 
 export interface Env {
   GREENLIGHT_DO: DurableObjectNamespace<GreenlightDO>;
-  GREENLIGHT_MODEL: string;
-  GREENLIGHT_API_KEY: string;
-  GREENLIGHT_MAX_ITERATIONS: string;
-  GREENLIGHT_LOOP_INTERVAL: string;
-  GREENLIGHT_AUTO_PUBLISH: string;
+  AI: Ai;
 }
 
 /**
