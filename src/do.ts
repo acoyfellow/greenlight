@@ -188,7 +188,7 @@ export class GreenlightDO extends DurableObject<Env> {
       await next();
     });
 
-    app.get("/demo/health", (c) => {
+    app.get("/demo/health", () => {
       const cfg = this.getConfig();
       if (cfg.demoFailureMode) {
         return jsonRaw({ ok: false, mode: "broken" }, 500);
