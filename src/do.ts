@@ -780,7 +780,10 @@ export class GreenlightDO extends DurableObject<Env> {
       /^(GET|POST|PUT|DELETE|PATCH)\s+(\S+)\s+twice\s+within\s+(\d+)s\s*(?:→|->)\s*second\s+(?:response\s+)?\.(\w+)\s+is\s+(.+)$/i
     );
     if (twice) {
-      const [, method, path, _seconds, field, raw] = twice;
+      const method = twice[1]!;
+      const path = twice[2]!;
+      const field = twice[4]!;
+      const raw = twice[5]!;
       await fetch(endpoint + path, { method });
       const second = await fetch(endpoint + path, { method });
       const secondBody = await second.json() as Record<string, unknown>;
@@ -795,7 +798,10 @@ export class GreenlightDO extends DurableObject<Env> {
       /^(GET|POST|PUT|DELETE|PATCH)\s+(\S+)\s+with\s+(\{.*\})\s+returns\s+(\d+)$/i
     );
     if (withBody) {
-      const [, method, path, bodyRaw, statusRaw] = withBody;
+      const method = withBody[1]!;
+      const path = withBody[2]!;
+      const bodyRaw = withBody[3]!;
+      const statusRaw = withBody[4]!;
       let body: unknown;
       try {
         body = JSON.parse(bodyRaw);
@@ -816,7 +822,9 @@ export class GreenlightDO extends DurableObject<Env> {
 
     const returns = text.match(/^(GET|POST|PUT|DELETE|PATCH)\s+(\S+)\s+returns\s+(\d+)$/i);
     if (returns) {
-      const [, method, path, statusRaw] = returns;
+      const method = returns[1]!;
+      const path = returns[2]!;
+      const statusRaw = returns[3]!;
       const res = await fetch(endpoint + path, { method });
       const expectedStatus = Number(statusRaw);
       if (res.status !== expectedStatus) {
@@ -829,7 +837,10 @@ export class GreenlightDO extends DurableObject<Env> {
       /^(GET|POST|PUT|DELETE|PATCH)\s+(\S+)\s*(?:→|->)\s*\.(\w+)\s+is\s+a\s+(number|string|boolean|object|array)$/i
     );
     if (typeMatch) {
-      const [, method, path, field, type] = typeMatch;
+      const method = typeMatch[1]!;
+      const path = typeMatch[2]!;
+      const field = typeMatch[3]!;
+      const type = typeMatch[4]!;
       const res = await fetch(endpoint + path, { method });
       const body = await res.json() as Record<string, unknown>;
       const actual = body[field];
@@ -855,7 +866,10 @@ export class GreenlightDO extends DurableObject<Env> {
       /^(GET|POST|PUT|DELETE|PATCH)\s+(\S+)\s*(?:→|->)\s*\.(\w+)\s+equals\s+(.+)$/i
     );
     if (equals) {
-      const [, method, path, field, raw] = equals;
+      const method = equals[1]!;
+      const path = equals[2]!;
+      const field = equals[3]!;
+      const raw = equals[4]!;
       const res = await fetch(endpoint + path, { method });
       const body = await res.json() as Record<string, unknown>;
       const expected = this.parseLiteral(raw);
@@ -869,7 +883,9 @@ export class GreenlightDO extends DurableObject<Env> {
       /^(GET|POST|PUT|DELETE|PATCH)\s+(\S+)\s*(?:→|->)\s*(\S+)\s+header\s+exists$/i
     );
     if (header) {
-      const [, method, path, key] = header;
+      const method = header[1]!;
+      const path = header[2]!;
+      const key = header[3]!;
       const res = await fetch(endpoint + path, { method });
       if (!res.headers.has(key)) {
         throw new Error(`Expected header ${key} to exist`);
@@ -881,7 +897,9 @@ export class GreenlightDO extends DurableObject<Env> {
       /^(GET|POST|PUT|DELETE|PATCH)\s+(\S+)\s*(?:→|->)\s*response\s+time\s*<\s*(\d+)ms$/i
     );
     if (time) {
-      const [, method, path, msRaw] = time;
+      const method = time[1]!;
+      const path = time[2]!;
+      const msRaw = time[3]!;
       const start = Date.now();
       await fetch(endpoint + path, { method });
       const elapsed = Date.now() - start;
@@ -896,7 +914,9 @@ export class GreenlightDO extends DurableObject<Env> {
       /^(GET|POST|PUT|DELETE|PATCH)\s+(\S+)\s*(?:→|->)\s*response\s+is\s+array\s+with\s+length\s*>\s*(\d+)$/i
     );
     if (array) {
-      const [, method, path, minRaw] = array;
+      const method = array[1]!;
+      const path = array[2]!;
+      const minRaw = array[3]!;
       const res = await fetch(endpoint + path, { method });
       const body = await res.json() as unknown;
       if (!Array.isArray(body)) {
