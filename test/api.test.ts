@@ -2,10 +2,19 @@ import { describe, it, expect } from "vitest";
 import { SELF } from "cloudflare:test";
 import type { Envelope, Gate, LoopState } from "../src/types.js";
 
-// Tests hit the Worker's fetch handler via SELF
-// Worker routes to DO based on a project name header or path
+// NOTE: API tests share a single DO ("default") via the Worker entrypoint.
+// Tests should be independent of gate state where possible,
+// or explicitly set up their own preconditions.
 
 describe("HTTP API", () => {
+  describe("GET /", () => {
+    it("returns HTML UI", async () => {
+      const res = await SELF.fetch("http://localhost/");
+      expect(res.status).toBe(200);
+      expect(res.headers.get("content-type")).toContain("text/html");
+    });
+  });
+
   describe("POST /gates", () => {
     it("adds a gate and returns envelope", async () => {
       const res = await SELF.fetch("http://localhost/gates", {
@@ -16,6 +25,7 @@ describe("HTTP API", () => {
       expect(res.status).toBe(200);
       const body = (await res.json()) as Envelope<Gate>;
       expect(body.ok).toBe(true);
+      expect(body.command).toBe("POST /gates");
       expect(body.result?.name).toBeTruthy();
       expect(body.result?.status).toBe("red");
       expect(body.next_actions.length).toBeGreaterThan(0);
@@ -36,7 +46,7 @@ describe("HTTP API", () => {
       expect(body.result?.name).toBe("custom-check");
     });
 
-    it("rejects empty assertion", async () => {
+    it("rejects missing assertion and fn", async () => {
       const res = await SELF.fetch("http://localhost/gates", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -52,31 +62,25 @@ describe("HTTP API", () => {
 
   describe("GET /gates", () => {
     it("lists gates with status", async () => {
-      // Add a gate first
-      await SELF.fetch("http://localhost/gates", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ assertion: "GET /api/test returns 200" }),
-      });
-
       const res = await SELF.fetch("http://localhost/gates");
       expect(res.status).toBe(200);
       const body = (await res.json()) as Envelope<{ gates: Gate[] }>;
       expect(body.ok).toBe(true);
+      expect(body.command).toBe("GET /gates");
       expect(Array.isArray(body.result?.gates)).toBe(true);
     });
   });
 
   describe("DELETE /gates/:name", () => {
-    it("removes a gate", async () => {
-      // Add then remove
+    it("removes an existing gate", async () => {
+      // Add a gate with a unique name
       await SELF.fetch("http://localhost/gates", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ assertion: "GET /api/removeme returns 200" }),
+        body: JSON.stringify({ assertion: "GET /api/delete-test returns 200" }),
       });
 
-      const res = await SELF.fetch("http://localhost/gates/get-api-removeme-returns-200", {
+      const res = await SELF.fetch("http://localhost/gates/get-api-delete-test-returns-200", {
         method: "DELETE",
       });
       expect(res.status).toBe(200);
@@ -86,7 +90,7 @@ describe("HTTP API", () => {
     });
 
     it("returns 404 for non-existent gate", async () => {
-      const res = await SELF.fetch("http://localhost/gates/nonexistent", {
+      const res = await SELF.fetch("http://localhost/gates/does-not-exist", {
         method: "DELETE",
       });
       expect(res.status).toBe(404);
@@ -105,6 +109,18 @@ describe("HTTP API", () => {
       expect(res.status).toBe(200);
       const body = (await res.json()) as Envelope;
       expect(body.ok).toBe(true);
+      expect(body.command).toBe("POST /nudge");
+    });
+
+    it("rejects empty nudge", async () => {
+      const res = await SELF.fetch("http://localhost/nudge", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({}),
+      });
+      expect(res.status).toBe(400);
+      const body = (await res.json()) as Envelope;
+      expect(body.ok).toBe(false);
     });
   });
 
@@ -117,6 +133,7 @@ describe("HTTP API", () => {
         gates: { total: number; red: number; green: number; stuck: number };
       }>;
       expect(body.ok).toBe(true);
+      expect(body.command).toBe("GET /status");
       expect(body.result?.loop).toBeTruthy();
       expect(body.result?.gates).toBeTruthy();
       expect(typeof body.result?.gates.total).toBe("number");
@@ -124,12 +141,12 @@ describe("HTTP API", () => {
   });
 
   describe("POST /start", () => {
-    it("starts the loop", async () => {
-      // Add a gate first
+    it("starts the loop when gates exist", async () => {
+      // Ensure at least one gate
       await SELF.fetch("http://localhost/gates", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ assertion: "GET /api/health returns 200" }),
+        body: JSON.stringify({ assertion: "GET /api/start-test returns 200" }),
       });
 
       const res = await SELF.fetch("http://localhost/start", { method: "POST" });
@@ -141,15 +158,7 @@ describe("HTTP API", () => {
   });
 
   describe("POST /pause", () => {
-    it("pauses the loop", async () => {
-      // Add gate, start, then pause
-      await SELF.fetch("http://localhost/gates", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ assertion: "GET /api/health returns 200" }),
-      });
-      await SELF.fetch("http://localhost/start", { method: "POST" });
-
+    it("pauses a running loop", async () => {
       const res = await SELF.fetch("http://localhost/pause", { method: "POST" });
       expect(res.status).toBe(200);
       const body = (await res.json()) as Envelope<LoopState>;
@@ -158,7 +167,7 @@ describe("HTTP API", () => {
     });
   });
 
-  describe("all responses follow envelope format", () => {
+  describe("envelope format", () => {
     it("every response has ok, command, and next_actions", async () => {
       const endpoints = [
         ["GET", "/status"],
@@ -169,6 +178,8 @@ describe("HTTP API", () => {
         const res = await SELF.fetch(`http://localhost${path}`, { method });
         const body = (await res.json()) as Envelope;
         expect(body).toHaveProperty("ok");
+        expect(body).toHaveProperty("command");
+        expect(typeof body.command).toBe("string");
         expect(body).toHaveProperty("next_actions");
         expect(Array.isArray(body.next_actions)).toBe(true);
       }

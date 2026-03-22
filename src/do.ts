@@ -1,5 +1,5 @@
 import { DurableObject } from "cloudflare:workers";
-import type { Gate, Memory, Nudge, LoopState } from "./types.js";
+import type { Gate, Memory, Nudge, LoopState, Config } from "./types.js";
 
 export interface Env {
   GREENLIGHT_DO: DurableObjectNamespace<GreenlightDO>;
@@ -69,6 +69,16 @@ export class GreenlightDO extends DurableObject<Env> {
   }
 
   consumeNudges(): Nudge[] {
+    throw new Error("not implemented");
+  }
+
+  // --- Config ---
+
+  getConfig(): Config {
+    throw new Error("not implemented");
+  }
+
+  setConfig(_key: keyof Config, _value: Config[keyof Config]): void {
     throw new Error("not implemented");
   }
 

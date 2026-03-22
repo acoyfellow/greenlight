@@ -8,17 +8,18 @@ function freshDO() {
   return env.GREENLIGHT_DO.get(id) as DurableObjectStub<GreenlightDO>;
 }
 
-describe("Loop state", () => {
-  it("starts idle", async () => {
+describe("Loop state machine", () => {
+  it("starts idle with iteration 0", async () => {
     const stub = freshDO();
     await runInDurableObject(stub, async (instance: GreenlightDO) => {
       const state = instance.getLoopState();
       expect(state.status).toBe("idle");
       expect(state.iteration).toBe(0);
+      expect(state.lastRunAt).toBeUndefined();
     });
   });
 
-  it("transitions to running on start", async () => {
+  it("idle → running when gates exist", async () => {
     const stub = freshDO();
     await runInDurableObject(stub, async (instance: GreenlightDO) => {
       instance.addGate("GET /api/health returns 200");
@@ -35,7 +36,7 @@ describe("Loop state", () => {
     });
   });
 
-  it("transitions to paused on pause", async () => {
+  it("running → paused", async () => {
     const stub = freshDO();
     await runInDurableObject(stub, async (instance: GreenlightDO) => {
       instance.addGate("GET /api/health returns 200");
@@ -46,7 +47,7 @@ describe("Loop state", () => {
     });
   });
 
-  it("resumes from paused to running", async () => {
+  it("paused → running", async () => {
     const stub = freshDO();
     await runInDurableObject(stub, async (instance: GreenlightDO) => {
       instance.addGate("GET /api/health returns 200");
@@ -55,6 +56,26 @@ describe("Loop state", () => {
       instance.startLoop();
       const state = instance.getLoopState();
       expect(state.status).toBe("running");
+    });
+  });
+
+  it("cannot pause when idle", async () => {
+    const stub = freshDO();
+    await runInDurableObject(stub, async (instance: GreenlightDO) => {
+      expect(() => instance.pauseLoop()).toThrow();
+    });
+  });
+
+  it("tracks iteration count", async () => {
+    const stub = freshDO();
+    await runInDurableObject(stub, async (instance: GreenlightDO) => {
+      instance.addGate("GET /api/health returns 200");
+      instance.startLoop();
+      // Simulate an iteration completing by calling alarm
+      await instance.alarm();
+      const state = instance.getLoopState();
+      expect(state.iteration).toBeGreaterThanOrEqual(1);
+      expect(state.lastRunAt).toBeTruthy();
     });
   });
 });
