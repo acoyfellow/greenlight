@@ -1236,25 +1236,21 @@ export class GreenlightDO extends DurableObject<Env> {
 <body>
   <main>
     <section class="card header">
-      <h1>greenlight</h1>
-      <p>Verifiable gate runner. Multi-project, live logs, run history, SLO, proof bundle.</p>
+      <h1>Contract-test any live endpoint in 60 seconds.</h1>
+      <p>Define gates, watch regressions go red, recover to green, export proof.</p>
       <div class="row">
         <div class="controls">
           <span id="projectLabel" class="chip">project: default</span>
-          <span id="loopChip" class="chip">loop: idle</span>
+          <span id="passRateChip" class="chip">pass 24h: 0%</span>
+          <span id="proofFreshnessChip" class="chip">proof: never</span>
           <span id="streamState" class="chip">stream: connecting</span>
         </div>
         <div class="controls">
-          <button id="toggleLoopBtn" type="button">Start</button>
-          <button id="runNowBtn" type="button">Run now</button>
-          <button id="proofBtn" type="button">Download proof</button>
+          <button id="demoCtaBtn" type="button">Run 60-second demo</button>
+          <button id="proofBtn" type="button">See proof JSON</button>
         </div>
       </div>
-      <form id="apiKeyForm">
-        <input id="apiKeyInput" placeholder="Optional API key (x-api-key)" />
-        <button type="submit">Save key</button>
-      </form>
-      <div class="muted" id="authState">auth: unknown</div>
+      <div class="muted">1) Bootstrap demo gates 2) Break endpoint 3) Recover + proof.</div>
     </section>
 
     <section class="card">
@@ -1268,11 +1264,18 @@ export class GreenlightDO extends DurableObject<Env> {
       </form>
       <div class="row" style="margin-top:8px;">
         <div class="controls">
+          <button id="toggleLoopBtn" type="button">Start</button>
+          <button id="runNowBtn" type="button">Run now</button>
           <button id="bootstrapDemoBtn" type="button">Bootstrap demo gates</button>
           <button id="toggleDemoFailureBtn" type="button">Break demo endpoint</button>
         </div>
         <span id="gateCount" class="muted">gates: 0</span>
       </div>
+      <form id="apiKeyForm">
+        <input id="apiKeyInput" placeholder="Optional API key (x-api-key)" />
+        <button type="submit">Save key</button>
+      </form>
+      <div class="muted" id="authState">auth: unknown</div>
     </section>
 
     <section class="grid">
@@ -1329,6 +1332,7 @@ export class GreenlightDO extends DurableObject<Env> {
         demoFailureMode: false,
         slo: null,
         authEnabled: false,
+        lastProofAt: localStorage.getItem("greenlight_last_proof_at") || "",
         apiKey: localStorage.getItem("greenlight_api_key") || "",
       };
 
@@ -1347,9 +1351,11 @@ export class GreenlightDO extends DurableObject<Env> {
       const logPanel = $("logPanel");
       const streamState = $("streamState");
       const projectLabel = $("projectLabel");
-      const loopChip = $("loopChip");
+      const passRateChip = $("passRateChip");
+      const proofFreshnessChip = $("proofFreshnessChip");
       const authState = $("authState");
       const templateList = $("templateList");
+      const demoCtaBtn = $("demoCtaBtn");
       const toggleLoopBtn = $("toggleLoopBtn");
       const toggleDemoFailureBtn = $("toggleDemoFailureBtn");
       const runNowBtn = $("runNowBtn");
@@ -1388,6 +1394,17 @@ export class GreenlightDO extends DurableObject<Env> {
         const body = await res.json();
         if (!body.ok) throw new Error(body.error && body.error.message ? body.error.message : "request failed");
         return body;
+      };
+
+      const relativeAge = (iso) => {
+        if (!iso) return "never";
+        const then = new Date(iso).getTime();
+        if (!Number.isFinite(then)) return "never";
+        const diff = Math.max(0, Date.now() - then);
+        const mins = Math.floor(diff / 60000);
+        if (mins < 1) return "<1m ago";
+        if (mins < 60) return mins + "m ago";
+        return Math.floor(mins / 60) + "h ago";
       };
 
       const renderGates = () => {
@@ -1456,7 +1473,8 @@ export class GreenlightDO extends DurableObject<Env> {
       };
 
       const renderHeader = () => {
-        loopChip.textContent = "loop: " + state.loop;
+        passRateChip.textContent = "pass 24h: " + (state.slo ? state.slo.passRate24h : 0) + "%";
+        proofFreshnessChip.textContent = "proof: " + relativeAge(state.lastProofAt);
         toggleLoopBtn.textContent = state.loop === "running" ? "Pause" : "Start";
         toggleDemoFailureBtn.textContent = state.demoFailureMode ? "Fix demo endpoint" : "Break demo endpoint";
         authState.textContent = "auth: " + (state.authEnabled ? "enabled" : "disabled");
@@ -1536,6 +1554,20 @@ export class GreenlightDO extends DurableObject<Env> {
         addLog("api key saved in browser storage");
       });
 
+      demoCtaBtn.addEventListener("click", async () => {
+        demoCtaBtn.disabled = true;
+        try {
+          await request("/demo/bootstrap", { method: "POST", headers: authHeaders() });
+          await request("/run", { method: "POST", headers: authHeaders() });
+          await refresh();
+          addLog("60-second demo completed");
+        } catch (err) {
+          addLog("60-second demo failed: " + String(err));
+        } finally {
+          demoCtaBtn.disabled = false;
+        }
+      });
+
       toggleLoopBtn.addEventListener("click", async () => {
         try {
           await request(state.loop === "running" ? "/pause" : "/start", {
@@ -1591,6 +1623,9 @@ export class GreenlightDO extends DurableObject<Env> {
           link.download = "greenlight-proof-" + state.project + ".json";
           link.click();
           URL.revokeObjectURL(link.href);
+          state.lastProofAt = new Date().toISOString();
+          localStorage.setItem("greenlight_last_proof_at", state.lastProofAt);
+          renderHeader();
           addLog("proof bundle downloaded");
         } catch (err) {
           addLog("proof download failed: " + String(err));

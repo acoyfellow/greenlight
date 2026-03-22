@@ -1,10 +1,18 @@
 # greenlight
 
+**Contract-test any live endpoint in 60 seconds.**
+
 **The model can be non-deterministic. The funnel must be deterministic.**
 
 greenlight is a self-building loop on Cloudflare Workers. You define gates — executable assertions about what should be true. greenlight writes code until they pass, then ships it live. There is no spec. The gates are the spec.
 
 One Durable Object. One SQLite database. Zero containers. Instant cold start.
+
+### At a glance
+
+- For founders and solo builders who need proof, not vibes.
+- Define gates once; watch regressions go red and recoveries go green.
+- Export a proof bundle JSON you can share with users, teammates, or investors.
 
 ```
 npm install greenlight
