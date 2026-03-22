@@ -12,6 +12,23 @@ describe("HTTP API", () => {
       const res = await SELF.fetch("http://localhost/");
       expect(res.status).toBe(200);
       expect(res.headers.get("content-type")).toContain("text/html");
+      const html = await res.text();
+      expect(html).toContain("id=\"gateForm\"");
+      expect(html).toContain("id=\"nudgeForm\"");
+      expect(html).toContain("id=\"gatesList\"");
+      expect(html).toContain("id=\"logPanel\"");
+      expect(html).toContain("id=\"toggleLoopBtn\"");
+    });
+  });
+
+  describe("GET /stream", () => {
+    it("rejects non-websocket request", async () => {
+      const res = await SELF.fetch("http://localhost/stream");
+      expect(res.status).toBe(426);
+      const body = (await res.json()) as Envelope;
+      expect(body.ok).toBe(false);
+      expect(body.command).toBe("GET /stream");
+      expect(body.error?.code).toBe("BAD_REQUEST");
     });
   });
 
