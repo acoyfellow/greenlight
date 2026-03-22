@@ -1,14 +1,25 @@
+import { DurableObject } from "cloudflare:workers";
 import type { Gate, Memory, Nudge, LoopState } from "./types.js";
+
+export interface Env {
+  GREENLIGHT_DO: DurableObjectNamespace<GreenlightDO>;
+  GREENLIGHT_MODEL: string;
+  GREENLIGHT_API_KEY: string;
+  GREENLIGHT_MAX_ITERATIONS: string;
+  GREENLIGHT_LOOP_INTERVAL: string;
+  GREENLIGHT_AUTO_PUBLISH: string;
+}
 
 /**
  * The greenlight Durable Object.
  * One DO per project. SQLite for everything.
  */
-export class GreenlightDO implements DurableObject {
+export class GreenlightDO extends DurableObject<Env> {
   private sql: SqlStorage;
 
-  constructor(private state: DurableObjectState, private env: Record<string, unknown>) {
-    this.sql = state.storage.sql;
+  constructor(ctx: DurableObjectState, env: Env) {
+    super(ctx, env);
+    this.sql = ctx.storage.sql;
     this.migrate();
   }
 
@@ -21,7 +32,7 @@ export class GreenlightDO implements DurableObject {
     return new Response("not implemented", { status: 501 });
   }
 
-  async alarm(): Promise<void> {
+  override async alarm(): Promise<void> {
     // TODO: run one iteration of the loop
   }
 
