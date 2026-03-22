@@ -1,0 +1,44 @@
+{
+  "name": "greenlight",
+  "version": "0.0.1",
+  "description": "Gates go in red. Code comes out. Gates turn green. Everything in between is liquid.",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "lint": "oxlint src/ test/",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "check": "npm run typecheck && npm run lint",
+    "build": "tsc"
+  },
+  "keywords": [
+    "cloudflare",
+    "workers",
+    "durable-objects",
+    "gates",
+    "testing",
+    "ai",
+    "agent",
+    "self-building"
+  ],
+  "author": "acoyfellow",
+  "license": "MIT",
+  "devDependencies": {
+    "@cloudflare/vitest-pool-workers": "^0.8.0",
+    "@cloudflare/workers-types": "^4.20250620.0",
+    "oxlint": "^1.56.0",
+    "typescript": "^5.8.0",
+    "vitest": "^3.2.0"
+  }
+}
