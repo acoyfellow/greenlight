@@ -1,5 +1,4 @@
 import { DurableObject } from "cloudflare:workers";
-import { compileGate } from "./compile.js";
 import type { Config, Envelope, Gate, GateResult, LoopState, Memory, Nudge } from "./types.js";
 import { DEFAULT_CONFIG } from "./types.js";
 
@@ -769,21 +768,160 @@ export class GreenlightDO extends DurableObject<Env> {
 
   private async executeGate(gate: Gate, endpoint: string): Promise<void> {
     if (gate.fn) {
-      if (gate.fn.includes("export default")) {
-        const source = gate.fn.replace(/export\s+default\s+/, "return ");
-        const factory = new Function(source) as () => (endpoint: string) => Promise<void>;
-        const fn = factory();
-        await fn(endpoint);
-        return;
+      throw new Error("Custom function gates are not supported in runtime mode");
+    }
+    await this.executeAssertionGate(gate.assertion, endpoint);
+  }
+
+  private async executeAssertionGate(assertion: string, endpoint: string): Promise<void> {
+    const text = assertion.trim();
+
+    const twice = text.match(
+      /^(GET|POST|PUT|DELETE|PATCH)\s+(\S+)\s+twice\s+within\s+(\d+)s\s*(?:→|->)\s*second\s+(?:response\s+)?\.(\w+)\s+is\s+(.+)$/i
+    );
+    if (twice) {
+      const [, method, path, _seconds, field, raw] = twice;
+      await fetch(endpoint + path, { method });
+      const second = await fetch(endpoint + path, { method });
+      const secondBody = await second.json() as Record<string, unknown>;
+      const expected = this.parseLiteral(raw);
+      if (secondBody[field] !== expected) {
+        throw new Error(`Expected second .${field} to be ${String(expected)}, got ${String(secondBody[field])}`);
       }
-      const fn = new Function("endpoint", `return (async (endpoint) => { ${gate.fn} })(endpoint);`) as (endpoint: string) => Promise<void>;
-      await fn(endpoint);
       return;
     }
 
-    const body = compileGate(gate.assertion);
-    const fn = new Function("endpoint", `return (async () => { ${body} })();`) as (endpoint: string) => Promise<void>;
-    await fn(endpoint);
+    const withBody = text.match(
+      /^(GET|POST|PUT|DELETE|PATCH)\s+(\S+)\s+with\s+(\{.*\})\s+returns\s+(\d+)$/i
+    );
+    if (withBody) {
+      const [, method, path, bodyRaw, statusRaw] = withBody;
+      let body: unknown;
+      try {
+        body = JSON.parse(bodyRaw);
+      } catch {
+        throw new Error("Body assertions require valid JSON object syntax");
+      }
+      const res = await fetch(endpoint + path, {
+        method,
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(body),
+      });
+      const expectedStatus = Number(statusRaw);
+      if (res.status !== expectedStatus) {
+        throw new Error(`Expected status ${expectedStatus}, got ${res.status}`);
+      }
+      return;
+    }
+
+    const returns = text.match(/^(GET|POST|PUT|DELETE|PATCH)\s+(\S+)\s+returns\s+(\d+)$/i);
+    if (returns) {
+      const [, method, path, statusRaw] = returns;
+      const res = await fetch(endpoint + path, { method });
+      const expectedStatus = Number(statusRaw);
+      if (res.status !== expectedStatus) {
+        throw new Error(`Expected status ${expectedStatus}, got ${res.status}`);
+      }
+      return;
+    }
+
+    const typeMatch = text.match(
+      /^(GET|POST|PUT|DELETE|PATCH)\s+(\S+)\s*(?:→|->)\s*\.(\w+)\s+is\s+a\s+(number|string|boolean|object|array)$/i
+    );
+    if (typeMatch) {
+      const [, method, path, field, type] = typeMatch;
+      const res = await fetch(endpoint + path, { method });
+      const body = await res.json() as Record<string, unknown>;
+      const actual = body[field];
+      if (type === "array") {
+        if (!Array.isArray(actual)) {
+          throw new Error(`Expected .${field} to be array`);
+        }
+        return;
+      }
+      if (type === "object") {
+        if (typeof actual !== "object" || actual === null || Array.isArray(actual)) {
+          throw new Error(`Expected .${field} to be object`);
+        }
+        return;
+      }
+      if (typeof actual !== type) {
+        throw new Error(`Expected .${field} to be ${type}, got ${typeof actual}`);
+      }
+      return;
+    }
+
+    const equals = text.match(
+      /^(GET|POST|PUT|DELETE|PATCH)\s+(\S+)\s*(?:→|->)\s*\.(\w+)\s+equals\s+(.+)$/i
+    );
+    if (equals) {
+      const [, method, path, field, raw] = equals;
+      const res = await fetch(endpoint + path, { method });
+      const body = await res.json() as Record<string, unknown>;
+      const expected = this.parseLiteral(raw);
+      if (body[field] !== expected) {
+        throw new Error(`Expected .${field} to equal ${String(expected)}, got ${String(body[field])}`);
+      }
+      return;
+    }
+
+    const header = text.match(
+      /^(GET|POST|PUT|DELETE|PATCH)\s+(\S+)\s*(?:→|->)\s*(\S+)\s+header\s+exists$/i
+    );
+    if (header) {
+      const [, method, path, key] = header;
+      const res = await fetch(endpoint + path, { method });
+      if (!res.headers.has(key)) {
+        throw new Error(`Expected header ${key} to exist`);
+      }
+      return;
+    }
+
+    const time = text.match(
+      /^(GET|POST|PUT|DELETE|PATCH)\s+(\S+)\s*(?:→|->)\s*response\s+time\s*<\s*(\d+)ms$/i
+    );
+    if (time) {
+      const [, method, path, msRaw] = time;
+      const start = Date.now();
+      await fetch(endpoint + path, { method });
+      const elapsed = Date.now() - start;
+      const maxMs = Number(msRaw);
+      if (elapsed >= maxMs) {
+        throw new Error(`Response time ${elapsed}ms exceeded ${maxMs}ms`);
+      }
+      return;
+    }
+
+    const array = text.match(
+      /^(GET|POST|PUT|DELETE|PATCH)\s+(\S+)\s*(?:→|->)\s*response\s+is\s+array\s+with\s+length\s*>\s*(\d+)$/i
+    );
+    if (array) {
+      const [, method, path, minRaw] = array;
+      const res = await fetch(endpoint + path, { method });
+      const body = await res.json() as unknown;
+      if (!Array.isArray(body)) {
+        throw new Error("Expected response to be an array");
+      }
+      const min = Number(minRaw);
+      if (body.length <= min) {
+        throw new Error(`Expected response length > ${min}, got ${body.length}`);
+      }
+      return;
+    }
+
+    throw new Error(`Unparseable gate assertion: ${assertion}`);
+  }
+
+  private parseLiteral(raw: string): unknown {
+    const value = raw.trim();
+    if (value === "true") return true;
+    if (value === "false") return false;
+    if (value === "null") return null;
+    if (/^-?\d+(\.\d+)?$/.test(value)) return Number(value);
+    if ((value.startsWith("\"") && value.endsWith("\"")) || (value.startsWith("'") && value.endsWith("'"))) {
+      return value.slice(1, -1);
+    }
+    return value;
   }
 
   private listRuns(limit: number): Array<{
