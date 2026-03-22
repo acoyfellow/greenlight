@@ -1,5 +1,6 @@
 import { DurableObject } from "cloudflare:workers";
 import { Hono } from "hono";
+import { createRemoteJWKSet, jwtVerify, type JWTPayload } from "jose";
 import type { Config, Envelope, Gate, GateResult, LoopState, Memory, Nudge } from "./types.js";
 import { DEFAULT_CONFIG } from "./types.js";
 
@@ -77,6 +78,7 @@ export class GreenlightDO extends DurableObject<Env> {
   private sql: SqlStorage;
   private streamSockets = new Set<WebSocket>();
   private app: Hono<RouteEnv>;
+  private jwtJwksCache = new Map<string, ReturnType<typeof createRemoteJWKSet>>();
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
@@ -163,6 +165,17 @@ export class GreenlightDO extends DurableObject<Env> {
         data TEXT
       )
     `);
+    this.sql.exec(`
+      CREATE TABLE IF NOT EXISTS auth_tokens (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        name TEXT,
+        token_hash TEXT UNIQUE,
+        scope TEXT,
+        created_at TEXT,
+        last_used_at TEXT,
+        revoked_at TEXT
+      )
+    `);
     const count = [...this.sql.exec(`SELECT COUNT(*) as c FROM loop_state`)][0]!.c as number;
     if (count === 0) {
       this.sql.exec(`INSERT INTO loop_state (status, iteration) VALUES ('idle', 0)`);
@@ -227,40 +240,135 @@ export class GreenlightDO extends DurableObject<Env> {
 
     app.get("/auth/status", (c) => {
       const command = c.get("command");
-      const authEnabled = this.getConfigValue("apiKeyHash") !== undefined;
-      return json200(envelope(command, true, { authEnabled }));
+      return json200(envelope(command, true, this.getAuthSummary()));
+    });
+
+    app.get("/auth/tokens", (c) => {
+      const command = c.get("command");
+      return json200(envelope(command, true, { tokens: this.listAuthTokens() }));
     });
 
     app.post("/auth/bootstrap", async (c) => {
       const command = c.get("command");
-      if (this.getConfigValue("apiKeyHash")) {
-        throw new HttpError(409, "AUTH_ALREADY_ENABLED", "API key already configured", "Use POST /auth/rotate");
+      if (this.hasApiKeyAuthEnabled()) {
+        throw new HttpError(409, "AUTH_ALREADY_ENABLED", "API key auth already configured", "Use POST /auth/rotate");
       }
-      const json = await c.req.json() as Record<string, unknown>;
-      const apiKey = String(json.apiKey ?? "").trim();
-      if (!apiKey) {
-        throw new HttpError(400, "MISSING_FIELD", "'apiKey' is required", "Provide a non-empty apiKey");
+
+      let json: Record<string, unknown> = {};
+      try {
+        json = await c.req.json() as Record<string, unknown>;
+      } catch {
+        json = {};
       }
-      const hash = await this.hashValue(apiKey);
-      this.setConfigValue("apiKeyHash", hash);
-      this.broadcastLog("auth_bootstrapped", "API key auth enabled");
-      return json200(envelope(command, true, { authEnabled: true }));
+
+      const provided = String(json.apiKey ?? "").trim();
+      const apiKey = provided || this.generateApiToken();
+      const token = await this.createAuthToken("primary", "admin", apiKey);
+      this.setConfigValue("apiKeyHash", token.hash);
+      this.broadcastLog("auth_bootstrapped", "Auth bootstrap complete", { tokenId: token.id });
+
+      return json200(envelope(command, true, {
+        authEnabled: true,
+        apiKey,
+        token: { id: token.id, name: token.name, scope: token.scope },
+      }));
     });
 
     app.post("/auth/rotate", async (c) => {
       const command = c.get("command");
-      if (!this.getConfigValue("apiKeyHash")) {
+      if (!this.hasApiKeyAuthEnabled()) {
+        throw new HttpError(400, "AUTH_DISABLED", "API key auth not configured", "Call POST /auth/bootstrap");
+      }
+
+      let json: Record<string, unknown> = {};
+      try {
+        json = await c.req.json() as Record<string, unknown>;
+      } catch {
+        json = {};
+      }
+
+      const provided = String(json.apiKey ?? "").trim();
+      const apiKey = provided || this.generateApiToken();
+      const token = await this.createAuthToken(`rotated-${Date.now()}`, "admin", apiKey);
+      this.setConfigValue("apiKeyHash", token.hash);
+      this.broadcastLog("auth_rotated", "Primary API key rotated", { tokenId: token.id });
+      return json200(envelope(command, true, {
+        rotated: true,
+        apiKey,
+        token: { id: token.id, name: token.name, scope: token.scope },
+      }));
+    });
+
+    app.post("/auth/tokens", async (c) => {
+      const command = c.get("command");
+      if (!this.hasApiKeyAuthEnabled()) {
         throw new HttpError(400, "AUTH_DISABLED", "API key auth not configured", "Call POST /auth/bootstrap");
       }
       const json = await c.req.json() as Record<string, unknown>;
-      const apiKey = String(json.apiKey ?? "").trim();
-      if (!apiKey) {
-        throw new HttpError(400, "MISSING_FIELD", "'apiKey' is required", "Provide a non-empty apiKey");
+      const name = String(json.name ?? "").trim() || `token-${Date.now()}`;
+      const scopeRaw = String(json.scope ?? "write").trim().toLowerCase();
+      const scope = this.validateAuthScope(scopeRaw);
+      const token = await this.createAuthToken(name, scope);
+      this.broadcastLog("auth_token_created", `Auth token created: ${name}`, { tokenId: token.id, scope });
+      return json200(envelope(command, true, {
+        token: { id: token.id, name: token.name, scope: token.scope },
+        apiKey: token.apiKey,
+      }));
+    });
+
+    app.delete("/auth/tokens/:id", (c) => {
+      const command = c.get("command");
+      const id = Number(c.req.param("id"));
+      if (!Number.isFinite(id)) {
+        throw new HttpError(400, "BAD_REQUEST", "Invalid token id");
       }
-      const hash = await this.hashValue(apiKey);
-      this.setConfigValue("apiKeyHash", hash);
-      this.broadcastLog("auth_rotated", "API key rotated");
-      return json200(envelope(command, true, { rotated: true }));
+      const revoked = this.revokeAuthToken(id);
+      if (!revoked) {
+        throw new HttpError(404, "NOT_FOUND", "Token not found");
+      }
+      this.broadcastLog("auth_token_revoked", "Auth token revoked", { tokenId: id });
+      return json200(envelope(command, true, { revoked: true, tokenId: id }));
+    });
+
+    app.get("/auth/jwt", (c) => {
+      const command = c.get("command");
+      return json200(envelope(command, true, { jwt: this.getJwtSettings() }));
+    });
+
+    app.post("/auth/jwt", async (c) => {
+      const command = c.get("command");
+      const json = await c.req.json() as Record<string, unknown>;
+      const jwksUrl = String(json.jwksUrl ?? "").trim();
+      if (!jwksUrl) {
+        throw new HttpError(400, "MISSING_FIELD", "'jwksUrl' is required", "Provide JWKS URL");
+      }
+      const issuer = String(json.issuer ?? "").trim();
+      const audience = String(json.audience ?? "").trim();
+      const requiredScope = String(json.requiredScope ?? "greenlight:write").trim() || "greenlight:write";
+      this.setConfigValue("authJwtJwksUrl", jwksUrl);
+      this.setConfigValue("authJwtIssuer", issuer);
+      this.setConfigValue("authJwtAudience", audience);
+      this.setConfigValue("authJwtRequiredScope", requiredScope);
+      this.jwtJwksCache.delete(jwksUrl);
+      this.broadcastLog("auth_jwt_configured", "JWT auth configured");
+      return json200(envelope(command, true, { jwt: this.getJwtSettings() }));
+    });
+
+    app.delete("/auth/jwt", (c) => {
+      const command = c.get("command");
+      this.deleteConfigValue("authJwtJwksUrl");
+      this.deleteConfigValue("authJwtIssuer");
+      this.deleteConfigValue("authJwtAudience");
+      this.deleteConfigValue("authJwtRequiredScope");
+      this.jwtJwksCache.clear();
+      this.broadcastLog("auth_jwt_disabled", "JWT auth disabled");
+      return json200(envelope(command, true, { jwt: this.getJwtSettings() }));
+    });
+
+    app.get("/auth/proof", async (c) => {
+      const command = c.get("command");
+      const proof = await this.buildAuthProof();
+      return json200(envelope(command, true, proof));
     });
 
     app.get("/templates", (c) => {
@@ -271,9 +379,11 @@ export class GreenlightDO extends DurableObject<Env> {
     app.get("/config", (c) => {
       const command = c.get("command");
       const config = this.getConfig();
+      const auth = this.getAuthSummary();
       return json200(envelope(command, true, {
         config,
-        authEnabled: this.getConfigValue("apiKeyHash") !== undefined,
+        authEnabled: auth.authEnabled,
+        authMethods: auth.methods,
       }));
     });
 
@@ -333,7 +443,7 @@ export class GreenlightDO extends DurableObject<Env> {
       return json200(envelope(command, true, { slo: this.getSloSummary() }));
     });
 
-    app.get("/proof", (c) => {
+    app.get("/proof", async (c) => {
       const command = c.get("command");
       const proof = {
         generatedAt: new Date().toISOString(),
@@ -342,6 +452,8 @@ export class GreenlightDO extends DurableObject<Env> {
         recentRuns: this.listRuns(30),
         slo: this.getSloSummary(),
         config: this.getConfig(),
+        auth: this.getAuthSummary(),
+        authProof: await this.buildAuthProof(),
       };
       return json200(envelope(command, true, proof));
     });
@@ -1124,6 +1236,10 @@ export class GreenlightDO extends DurableObject<Env> {
     this.sql.exec(`INSERT OR REPLACE INTO config (key, value) VALUES (?, ?)`, key, value);
   }
 
+  private deleteConfigValue(key: string): void {
+    this.sql.exec(`DELETE FROM config WHERE key = ?`, key);
+  }
+
   private async hashValue(value: string): Promise<string> {
     const bytes = new TextEncoder().encode(value);
     const digest = await crypto.subtle.digest("SHA-256", bytes);
@@ -1132,18 +1248,284 @@ export class GreenlightDO extends DurableObject<Env> {
 
   private async requireMutationAccess(request: Request): Promise<void> {
     this.enforceRateLimit(request);
-    const apiKeyHash = this.getConfigValue("apiKeyHash");
-    if (!apiKeyHash) {
+    const summary = this.getAuthSummary();
+    if (!summary.authEnabled) {
       return;
     }
-    const provided = request.headers.get("x-api-key");
-    if (!provided) {
-      throw new HttpError(401, "AUTH_REQUIRED", "Missing x-api-key header", "Provide x-api-key");
+
+    const explicitApiKey = request.headers.get("x-api-key")?.trim();
+    const bearerToken = this.getBearerToken(request);
+    const apiKey = explicitApiKey || (bearerToken && bearerToken.startsWith("glk_") ? bearerToken : undefined);
+
+    if (apiKey) {
+      const lookup = await this.lookupApiKey(apiKey);
+      if (!lookup.found) {
+        throw new HttpError(403, "AUTH_INVALID", "Invalid API key");
+      }
+      if (!this.scopeAllowsWrite(lookup.scope)) {
+        throw new HttpError(403, "AUTH_FORBIDDEN_SCOPE", "API key lacks write scope");
+      }
+      if (lookup.tokenId !== undefined) {
+        this.touchAuthToken(lookup.tokenId);
+      }
+      return;
     }
-    const providedHash = await this.hashValue(provided);
-    if (providedHash !== apiKeyHash) {
-      throw new HttpError(403, "AUTH_INVALID", "Invalid API key");
+
+    if (summary.jwt.enabled && bearerToken) {
+      const payload = await this.verifyJwtToken(bearerToken, summary.jwt);
+      if (!this.jwtPayloadAllowsWrite(payload, summary.jwt.requiredScope)) {
+        throw new HttpError(403, "AUTH_FORBIDDEN_SCOPE", "JWT lacks required scope");
+      }
+      return;
     }
+
+    throw new HttpError(401, "AUTH_REQUIRED", "Missing credentials", "Provide x-api-key or Bearer token");
+  }
+
+  private getBearerToken(request: Request): string | undefined {
+    const auth = request.headers.get("authorization");
+    if (!auth) {
+      return undefined;
+    }
+    const match = auth.match(/^Bearer\s+(.+)$/i);
+    if (!match) {
+      return undefined;
+    }
+    return match[1]?.trim();
+  }
+
+  private hasApiKeyAuthEnabled(): boolean {
+    const legacy = this.getConfigValue("apiKeyHash");
+    const tokenCount = [...this.sql.exec(
+      `SELECT COUNT(*) as c FROM auth_tokens WHERE revoked_at IS NULL`
+    )][0]!.c as number;
+    return legacy !== undefined || tokenCount > 0;
+  }
+
+  private getJwtSettings(): {
+    enabled: boolean;
+    jwksUrl?: string;
+    issuer?: string;
+    audience?: string;
+    requiredScope: string;
+  } {
+    const jwksUrl = this.getConfigValue("authJwtJwksUrl")?.trim();
+    const issuer = this.getConfigValue("authJwtIssuer")?.trim();
+    const audience = this.getConfigValue("authJwtAudience")?.trim();
+    const requiredScope = this.getConfigValue("authJwtRequiredScope")?.trim() || "greenlight:write";
+    return {
+      enabled: Boolean(jwksUrl),
+      jwksUrl: jwksUrl || undefined,
+      issuer: issuer || undefined,
+      audience: audience || undefined,
+      requiredScope,
+    };
+  }
+
+  private getAuthSummary(): {
+    authEnabled: boolean;
+    methods: string[];
+    apiTokens: { active: number; legacyPrimary: boolean };
+    jwt: { enabled: boolean; jwksUrl?: string; issuer?: string; audience?: string; requiredScope: string };
+  } {
+    const active = [...this.sql.exec(
+      `SELECT COUNT(*) as c FROM auth_tokens WHERE revoked_at IS NULL`
+    )][0]!.c as number;
+    const legacyPrimary = this.getConfigValue("apiKeyHash") !== undefined;
+    const jwt = this.getJwtSettings();
+    const methods: string[] = [];
+    if (active > 0 || legacyPrimary) {
+      methods.push("api_key");
+    }
+    if (jwt.enabled) {
+      methods.push("jwt");
+    }
+    return {
+      authEnabled: methods.length > 0,
+      methods,
+      apiTokens: { active, legacyPrimary },
+      jwt,
+    };
+  }
+
+  private validateAuthScope(scope: string): "read" | "write" | "admin" {
+    if (scope === "read" || scope === "write" || scope === "admin") {
+      return scope;
+    }
+    throw new HttpError(400, "BAD_SCOPE", "Scope must be read, write, or admin");
+  }
+
+  private generateApiToken(): string {
+    const bytes = new Uint8Array(24);
+    crypto.getRandomValues(bytes);
+    const raw = btoa(String.fromCharCode(...bytes))
+      .replace(/\+/g, "-")
+      .replace(/\//g, "_")
+      .replace(/=+$/, "");
+    return `glk_${raw}`;
+  }
+
+  private async createAuthToken(
+    name: string,
+    scope: "read" | "write" | "admin",
+    providedApiKey?: string
+  ): Promise<{ id: number; name: string; scope: string; apiKey: string; hash: string }> {
+    const apiKey = providedApiKey ?? this.generateApiToken();
+    const hash = await this.hashValue(apiKey);
+    const now = new Date().toISOString();
+    this.sql.exec(
+      `INSERT INTO auth_tokens (name, token_hash, scope, created_at, last_used_at, revoked_at)
+       VALUES (?, ?, ?, ?, NULL, NULL)`,
+      name,
+      hash,
+      scope,
+      now
+    );
+    const id = [...this.sql.exec(`SELECT last_insert_rowid() as id`)][0]!.id as number;
+    return { id, name, scope, apiKey, hash };
+  }
+
+  private listAuthTokens(): Array<{
+    id: number;
+    name: string;
+    scope: string;
+    createdAt: string;
+    lastUsedAt?: string;
+    revoked: boolean;
+  }> {
+    const rows = [...this.sql.exec(`SELECT * FROM auth_tokens ORDER BY id DESC`)];
+    return rows.map(row => ({
+      id: row.id as number,
+      name: row.name as string,
+      scope: row.scope as string,
+      createdAt: row.created_at as string,
+      lastUsedAt: row.last_used_at as string | undefined ?? undefined,
+      revoked: Boolean(row.revoked_at),
+    }));
+  }
+
+  private revokeAuthToken(id: number): boolean {
+    const exists = [...this.sql.exec(`SELECT COUNT(*) as c FROM auth_tokens WHERE id = ?`, id)][0]!.c as number;
+    if (exists === 0) {
+      return false;
+    }
+    this.sql.exec(`UPDATE auth_tokens SET revoked_at = ? WHERE id = ?`, new Date().toISOString(), id);
+    return true;
+  }
+
+  private touchAuthToken(id: number): void {
+    this.sql.exec(`UPDATE auth_tokens SET last_used_at = ? WHERE id = ?`, new Date().toISOString(), id);
+  }
+
+  private async lookupApiKey(apiKey: string): Promise<{ found: boolean; scope: "read" | "write" | "admin"; tokenId?: number }> {
+    const hash = await this.hashValue(apiKey);
+
+    const tokenRows = [...this.sql.exec(
+      `SELECT id, scope FROM auth_tokens WHERE token_hash = ? AND revoked_at IS NULL LIMIT 1`,
+      hash
+    )];
+    if (tokenRows.length > 0) {
+      const row = tokenRows[0]!;
+      return {
+        found: true,
+        scope: this.validateAuthScope((row.scope as string).toLowerCase()),
+        tokenId: row.id as number,
+      };
+    }
+
+    const legacy = this.getConfigValue("apiKeyHash");
+    if (legacy && legacy === hash) {
+      return { found: true, scope: "admin" };
+    }
+
+    return { found: false, scope: "read" };
+  }
+
+  private scopeAllowsWrite(scope: "read" | "write" | "admin"): boolean {
+    return scope === "write" || scope === "admin";
+  }
+
+  private async verifyJwtToken(
+    token: string,
+    jwt: { enabled: boolean; jwksUrl?: string; issuer?: string; audience?: string }
+  ): Promise<JWTPayload> {
+    if (!jwt.enabled || !jwt.jwksUrl) {
+      throw new HttpError(401, "AUTH_REQUIRED", "JWT auth is not configured");
+    }
+    let jwks = this.jwtJwksCache.get(jwt.jwksUrl);
+    if (!jwks) {
+      jwks = createRemoteJWKSet(new URL(jwt.jwksUrl));
+      this.jwtJwksCache.set(jwt.jwksUrl, jwks);
+    }
+    try {
+      const verified = await jwtVerify(token, jwks, {
+        issuer: jwt.issuer,
+        audience: jwt.audience,
+      });
+      return verified.payload;
+    } catch {
+      throw new HttpError(403, "AUTH_INVALID", "Invalid JWT");
+    }
+  }
+
+  private jwtPayloadAllowsWrite(payload: JWTPayload, requiredScope: string): boolean {
+    const collect = (value: unknown): string[] => {
+      if (!value) return [];
+      if (typeof value === "string") return value.split(/[\s,]+/).filter(Boolean);
+      if (Array.isArray(value)) return value.filter(v => typeof v === "string") as string[];
+      return [];
+    };
+    const scopes = [
+      ...collect(payload.scope),
+      ...collect((payload as Record<string, unknown>).scopes),
+      ...collect((payload as Record<string, unknown>).permissions),
+    ];
+    return scopes.includes(requiredScope) || scopes.includes("greenlight:admin") || scopes.includes("admin");
+  }
+
+  private async buildAuthProof(): Promise<{
+    authEnabled: boolean;
+    methods: string[];
+    checks: {
+      anonymousMutationBlocked: boolean;
+      apiKeyAuthEnabled: boolean;
+      jwtConfigured: boolean;
+    };
+  }> {
+    const summary = this.getAuthSummary();
+    if (!summary.authEnabled) {
+      return {
+        authEnabled: false,
+        methods: [],
+        checks: {
+          anonymousMutationBlocked: false,
+          apiKeyAuthEnabled: false,
+          jwtConfigured: false,
+        },
+      };
+    }
+
+    let anonymousBlocked = false;
+    try {
+      await this.requireMutationAccess(new Request("http://internal/auth-proof", {
+        method: "POST",
+        headers: { "x-forwarded-for": "auth-proof-anon" },
+      }));
+    } catch (err) {
+      if (err instanceof HttpError && ["AUTH_REQUIRED", "AUTH_INVALID", "AUTH_FORBIDDEN_SCOPE"].includes(err.code)) {
+        anonymousBlocked = true;
+      }
+    }
+
+    return {
+      authEnabled: true,
+      methods: summary.methods,
+      checks: {
+        anonymousMutationBlocked: anonymousBlocked,
+        apiKeyAuthEnabled: summary.apiTokens.active > 0 || summary.apiTokens.legacyPrimary,
+        jwtConfigured: summary.jwt.enabled,
+      },
+    };
   }
 
   private enforceRateLimit(request: Request): void {

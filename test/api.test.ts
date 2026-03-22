@@ -288,5 +288,88 @@ describe("HTTP API", () => {
       });
       expect(withKey.status).toBe(200);
     });
+
+    it("supports token lifecycle create/list/revoke", async () => {
+      const project = `auth-token-${Date.now()}`;
+      const bootstrap = await SELF.fetch(`http://localhost/auth/bootstrap?project=${project}`, {
+        method: "POST",
+      });
+      expect(bootstrap.status).toBe(200);
+      const bootBody = (await bootstrap.json()) as Envelope<{ apiKey: string }>;
+      const adminKey = bootBody.result?.apiKey ?? "";
+      expect(adminKey.startsWith("glk_")).toBe(true);
+
+      const createToken = await SELF.fetch(`http://localhost/auth/tokens?project=${project}`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "x-api-key": adminKey,
+        },
+        body: JSON.stringify({ name: "ci-bot", scope: "write" }),
+      });
+      expect(createToken.status).toBe(200);
+      const createBody = (await createToken.json()) as Envelope<{
+        token: { id: number };
+        apiKey: string;
+      }>;
+      const tokenId = createBody.result?.token.id ?? 0;
+      const ciKey = createBody.result?.apiKey ?? "";
+      expect(tokenId).toBeGreaterThan(0);
+      expect(ciKey.startsWith("glk_")).toBe(true);
+
+      const listTokens = await SELF.fetch(`http://localhost/auth/tokens?project=${project}`);
+      expect(listTokens.status).toBe(200);
+      const listBody = (await listTokens.json()) as Envelope<{
+        tokens: Array<{ id: number; name: string; revoked: boolean }>;
+      }>;
+      expect(listBody.result?.tokens.some(t => t.id === tokenId && t.name === "ci-bot")).toBe(true);
+
+      const revoke = await SELF.fetch(`http://localhost/auth/tokens/${tokenId}?project=${project}`, {
+        method: "DELETE",
+        headers: { "x-api-key": adminKey },
+      });
+      expect(revoke.status).toBe(200);
+
+      const withRevoked = await SELF.fetch(`http://localhost/gates?project=${project}`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "x-api-key": ciKey,
+        },
+        body: JSON.stringify({ assertion: "GET /demo/health returns 200" }),
+      });
+      expect(withRevoked.status).toBe(403);
+    });
+  });
+
+  describe("jwt auth config", () => {
+    it("can configure jwt mode and enforce credentials", async () => {
+      const project = `jwt-${Date.now()}`;
+      const configure = await SELF.fetch(`http://localhost/auth/jwt?project=${project}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          jwksUrl: "https://example.com/.well-known/jwks.json",
+          requiredScope: "greenlight:write",
+        }),
+      });
+      expect(configure.status).toBe(200);
+
+      const status = await SELF.fetch(`http://localhost/auth/status?project=${project}`);
+      expect(status.status).toBe(200);
+      const statusBody = (await status.json()) as Envelope<{
+        authEnabled: boolean;
+        methods: string[];
+      }>;
+      expect(statusBody.result?.authEnabled).toBe(true);
+      expect(statusBody.result?.methods.includes("jwt")).toBe(true);
+
+      const blockedMutation = await SELF.fetch(`http://localhost/gates?project=${project}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ assertion: "GET /demo/health returns 200" }),
+      });
+      expect(blockedMutation.status).toBe(401);
+    });
   });
 });
