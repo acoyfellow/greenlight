@@ -1,4 +1,5 @@
 import { DurableObject } from "cloudflare:workers";
+import { Hono } from "hono";
 import type { Config, Envelope, Gate, GateResult, LoopState, Memory, Nudge } from "./types.js";
 import { DEFAULT_CONFIG } from "./types.js";
 
@@ -65,14 +66,23 @@ interface Template {
   description: string;
 }
 
+type RouteEnv = {
+  Bindings: Env;
+  Variables: {
+    command: string;
+  };
+};
+
 export class GreenlightDO extends DurableObject<Env> {
   private sql: SqlStorage;
   private streamSockets = new Set<WebSocket>();
+  private app: Hono<RouteEnv>;
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
     this.sql = ctx.storage.sql;
     this.migrate();
+    this.app = this.buildApp();
   }
 
   private migrate(): void {
@@ -160,263 +170,294 @@ export class GreenlightDO extends DurableObject<Env> {
   }
 
   async fetch(request: Request): Promise<Response> {
-    const url = new URL(request.url);
-    const path = url.pathname;
-    const method = request.method;
-    const command = `${method} ${path}`;
+    return this.app.fetch(request, this.env);
+  }
 
-    try {
-      if (method === "GET" && path === "/demo/health") {
-        const cfg = this.getConfig();
-        if (cfg.demoFailureMode) {
-          return jsonRaw({ ok: false, mode: "broken" }, 500);
+  private buildApp(): Hono<RouteEnv> {
+    const app = new Hono<RouteEnv>();
+
+    app.use("*", async (c, next) => {
+      c.set("command", `${c.req.method} ${c.req.path}`);
+      await next();
+    });
+
+    app.use("*", async (c, next) => {
+      if (["POST", "PUT", "PATCH", "DELETE"].includes(c.req.method) && c.req.path !== "/auth/bootstrap") {
+        await this.requireMutationAccess(c.req.raw);
+      }
+      await next();
+    });
+
+    app.get("/demo/health", (c) => {
+      const cfg = this.getConfig();
+      if (cfg.demoFailureMode) {
+        return jsonRaw({ ok: false, mode: "broken" }, 500);
+      }
+      return jsonRaw({ ok: true, mode: "healthy" }, 200);
+    });
+
+    app.get("/demo/price", () => jsonRaw({ price: 123.45, currency: "USD", cached: true }, 200));
+    app.get("/demo/items", () => jsonRaw([{ id: 1 }, { id: 2 }, { id: 3 }], 200));
+    app.get("/", () => html200(this.renderHomePage()));
+
+    app.get("/stream", (c) => {
+      const upgrade = c.req.header("Upgrade");
+      if (!upgrade || upgrade.toLowerCase() !== "websocket") {
+        throw new HttpError(426, "BAD_REQUEST", "Expected websocket upgrade", "Connect with a WebSocket client");
+      }
+
+      const pair = new WebSocketPair();
+      const client = pair[0];
+      const server = pair[1];
+      server.accept();
+      this.streamSockets.add(server);
+      server.addEventListener("close", () => this.streamSockets.delete(server));
+      server.addEventListener("error", () => this.streamSockets.delete(server));
+      const logs = this.listLogs(25);
+      for (const log of logs.reverse()) {
+        server.send(JSON.stringify(log));
+      }
+      server.send(JSON.stringify({
+        ts: new Date().toISOString(),
+        type: "stream_connected",
+        message: "Connected to greenlight stream",
+      }));
+      return new Response(null, { status: 101, webSocket: client });
+    });
+
+    app.get("/auth/status", (c) => {
+      const command = c.get("command");
+      const authEnabled = this.getConfigValue("apiKeyHash") !== undefined;
+      return json200(envelope(command, true, { authEnabled }));
+    });
+
+    app.post("/auth/bootstrap", async (c) => {
+      const command = c.get("command");
+      if (this.getConfigValue("apiKeyHash")) {
+        throw new HttpError(409, "AUTH_ALREADY_ENABLED", "API key already configured", "Use POST /auth/rotate");
+      }
+      const json = await c.req.json() as Record<string, unknown>;
+      const apiKey = String(json.apiKey ?? "").trim();
+      if (!apiKey) {
+        throw new HttpError(400, "MISSING_FIELD", "'apiKey' is required", "Provide a non-empty apiKey");
+      }
+      const hash = await this.hashValue(apiKey);
+      this.setConfigValue("apiKeyHash", hash);
+      this.broadcastLog("auth_bootstrapped", "API key auth enabled");
+      return json200(envelope(command, true, { authEnabled: true }));
+    });
+
+    app.post("/auth/rotate", async (c) => {
+      const command = c.get("command");
+      if (!this.getConfigValue("apiKeyHash")) {
+        throw new HttpError(400, "AUTH_DISABLED", "API key auth not configured", "Call POST /auth/bootstrap");
+      }
+      const json = await c.req.json() as Record<string, unknown>;
+      const apiKey = String(json.apiKey ?? "").trim();
+      if (!apiKey) {
+        throw new HttpError(400, "MISSING_FIELD", "'apiKey' is required", "Provide a non-empty apiKey");
+      }
+      const hash = await this.hashValue(apiKey);
+      this.setConfigValue("apiKeyHash", hash);
+      this.broadcastLog("auth_rotated", "API key rotated");
+      return json200(envelope(command, true, { rotated: true }));
+    });
+
+    app.get("/templates", (c) => {
+      const command = c.get("command");
+      return json200(envelope(command, true, { templates: this.getTemplates() }));
+    });
+
+    app.get("/config", (c) => {
+      const command = c.get("command");
+      const config = this.getConfig();
+      return json200(envelope(command, true, {
+        config,
+        authEnabled: this.getConfigValue("apiKeyHash") !== undefined,
+      }));
+    });
+
+    app.post("/config", async (c) => {
+      const command = c.get("command");
+      const json = await c.req.json() as Record<string, unknown>;
+      const key = String(json.key ?? "") as keyof Config;
+      const value = json.value as Config[keyof Config];
+      this.setConfig(key, value);
+      this.broadcastLog("config_updated", `Config updated: ${key}`);
+      return json200(envelope(command, true, { key, value }));
+    });
+
+    app.post("/demo/failure", async (c) => {
+      const command = c.get("command");
+      const json = await c.req.json() as Record<string, unknown>;
+      const enabled = Boolean(json.enabled);
+      this.setConfig("demoFailureMode", enabled);
+      this.broadcastLog("demo_failure_mode", enabled ? "Demo mode set to broken" : "Demo mode set to healthy");
+      return json200(envelope(command, true, { demoFailureMode: enabled }));
+    });
+
+    app.post("/demo/bootstrap", (c) => {
+      const command = c.get("command");
+      const templates = this.getTemplates();
+      let created = 0;
+      for (const template of templates) {
+        const name = this.gateNameFromAssertion(template.assertion);
+        if (this.getGateByName(name)) {
+          continue;
         }
-        return jsonRaw({ ok: true, mode: "healthy" }, 200);
+        this.addGate(template.assertion);
+        created += 1;
+      }
+      const origin = new URL(c.req.url).origin;
+      if (!this.getConfig().targetEndpoint) {
+        this.setConfig("targetEndpoint", origin);
+      }
+      this.broadcastLog("demo_bootstrap", `Bootstrapped demo gates: ${created}`, { created });
+      return json200(envelope(command, true, { created, templates: templates.length }));
+    });
+
+    app.get("/logs", (c) => {
+      const command = c.get("command");
+      const limit = Number(c.req.query("limit") ?? 100);
+      return json200(envelope(command, true, { logs: this.listLogs(limit) }));
+    });
+
+    app.get("/runs", (c) => {
+      const command = c.get("command");
+      const limit = Number(c.req.query("limit") ?? 25);
+      return json200(envelope(command, true, { runs: this.listRuns(limit) }));
+    });
+
+    app.get("/slo", (c) => {
+      const command = c.get("command");
+      return json200(envelope(command, true, { slo: this.getSloSummary() }));
+    });
+
+    app.get("/proof", (c) => {
+      const command = c.get("command");
+      const proof = {
+        generatedAt: new Date().toISOString(),
+        loop: this.getLoopState(),
+        gates: this.listGates(),
+        recentRuns: this.listRuns(30),
+        slo: this.getSloSummary(),
+        config: this.getConfig(),
+      };
+      return json200(envelope(command, true, proof));
+    });
+
+    app.post("/run", async (c) => {
+      const command = c.get("command");
+      const origin = new URL(c.req.url).origin;
+      const endpoint = this.resolveTargetEndpoint(origin);
+      this.bumpIteration();
+      const results = await this.runGates(endpoint);
+      this.broadcastLog("manual_run", "Manual run completed", { endpoint, gates: results.length });
+      return json200(envelope(command, true, { endpoint, results, slo: this.getSloSummary() }));
+    });
+
+    app.post("/gates", async (c) => {
+      const command = c.get("command");
+      const json = await c.req.json() as Record<string, unknown>;
+      const assertion = json.assertion as string | undefined;
+      const fn = json.fn as string | undefined;
+      const name = json.name as string | undefined;
+      if (!assertion && !fn) {
+        throw new HttpError(400, "MISSING_FIELD", "Either 'assertion' or 'fn' is required", "Provide 'assertion' or 'fn'");
       }
 
-      if (method === "GET" && path === "/demo/price") {
-        return jsonRaw({ price: 123.45, currency: "USD", cached: true }, 200);
+      const gate = fn ? this.addGate(name ?? assertion ?? "custom", fn) : this.addGate(assertion!);
+      this.broadcastLog("gate_added", `Gate added: ${gate.name}`, { name: gate.name, status: gate.status });
+      return json200(envelope(command, true, gate, undefined, undefined, [
+        { command: "GET /gates", description: "List all gates" },
+        { command: "POST /start", description: "Start the loop" },
+      ]));
+    });
+
+    app.get("/gates", (c) => {
+      const command = c.get("command");
+      return json200(envelope(command, true, { gates: this.listGates() }, undefined, undefined, [
+        { command: "POST /gates", description: "Add a gate" },
+        { command: "POST /start", description: "Start the loop" },
+      ]));
+    });
+
+    app.delete("/gates/:name", (c) => {
+      const command = c.get("command");
+      const name = decodeURIComponent(c.req.param("name"));
+      const removed = this.removeGate(name);
+      if (!removed) {
+        throw new HttpError(404, "NOT_FOUND", "Gate not found");
       }
+      this.broadcastLog("gate_removed", `Gate removed: ${name}`, { name });
+      return json200(envelope(command, true, { removed: true }, undefined, undefined, [
+        { command: "GET /gates", description: "List remaining gates" },
+      ]));
+    });
 
-      if (method === "GET" && path === "/demo/items") {
-        return jsonRaw([{ id: 1 }, { id: 2 }, { id: 3 }], 200);
+    app.post("/nudge", async (c) => {
+      const command = c.get("command");
+      const json = await c.req.json() as Record<string, unknown>;
+      const text = String(json.text ?? "").trim();
+      if (!text) {
+        throw new HttpError(400, "MISSING_FIELD", "'text' is required", "Provide a non-empty text");
       }
+      const nudge = this.addNudge(text);
+      this.broadcastLog("nudge_added", "Nudge added", { text });
+      return json200(envelope(command, true, nudge, undefined, undefined, [
+        { command: "GET /status", description: "Check loop status" },
+      ]));
+    });
 
-      if (method === "GET" && path === "/") {
-        return html200(this.renderHomePage());
-      }
+    app.get("/status", (c) => {
+      const command = c.get("command");
+      const loop = this.getLoopState();
+      const gates = this.listGates();
+      const summary = {
+        total: gates.length,
+        red: gates.filter(g => g.status === "red").length,
+        green: gates.filter(g => g.status === "green").length,
+        stuck: gates.filter(g => g.status === "stuck").length,
+      };
+      return json200(envelope(command, true, { loop, gates: summary }, undefined, undefined, [
+        { command: "POST /start", description: "Start the loop" },
+        { command: "POST /gates", description: "Add a gate" },
+      ]));
+    });
 
-      if (method === "GET" && path === "/stream") {
-        const upgrade = request.headers.get("Upgrade");
-        if (!upgrade || upgrade.toLowerCase() !== "websocket") {
-          throw new HttpError(426, "BAD_REQUEST", "Expected websocket upgrade", "Connect with a WebSocket client");
-        }
+    app.post("/start", (c) => {
+      const command = c.get("command");
+      const origin = new URL(c.req.url).origin;
+      this.startLoop(origin);
+      const state = this.getLoopState();
+      this.broadcastLog("loop_started", "Loop started", { status: state.status });
+      return json200(envelope(command, true, state, undefined, undefined, [
+        { command: "GET /status", description: "Check status" },
+        { command: "POST /pause", description: "Pause the loop" },
+      ]));
+    });
 
-        const pair = new WebSocketPair();
-        const client = pair[0];
-        const server = pair[1];
-        server.accept();
-        this.streamSockets.add(server);
-        server.addEventListener("close", () => this.streamSockets.delete(server));
-        server.addEventListener("error", () => this.streamSockets.delete(server));
-        const logs = this.listLogs(25);
-        for (const log of logs.reverse()) {
-          server.send(JSON.stringify(log));
-        }
-        server.send(JSON.stringify({
-          ts: new Date().toISOString(),
-          type: "stream_connected",
-          message: "Connected to greenlight stream",
-        }));
-        return new Response(null, { status: 101, webSocket: client });
-      }
+    app.post("/pause", (c) => {
+      const command = c.get("command");
+      this.pauseLoop();
+      const state = this.getLoopState();
+      this.broadcastLog("loop_paused", "Loop paused", { status: state.status });
+      return json200(envelope(command, true, state, undefined, undefined, [
+        { command: "POST /start", description: "Resume the loop" },
+        { command: "GET /status", description: "Check status" },
+      ]));
+    });
 
-      if (["POST", "PUT", "PATCH", "DELETE"].includes(method) && path !== "/auth/bootstrap") {
-        await this.requireMutationAccess(request);
-      }
+    app.notFound((c) => {
+      const command = c.get("command");
+      return json200(envelope(command, false, undefined, {
+        message: "Not found",
+        code: "NOT_FOUND",
+      }), 404);
+    });
 
-      if (method === "GET" && path === "/auth/status") {
-        const authEnabled = this.getConfigValue("apiKeyHash") !== undefined;
-        return json200(envelope(command, true, { authEnabled }));
-      }
-
-      if (method === "POST" && path === "/auth/bootstrap") {
-        if (this.getConfigValue("apiKeyHash")) {
-          throw new HttpError(409, "AUTH_ALREADY_ENABLED", "API key already configured", "Use POST /auth/rotate");
-        }
-        const json = await request.json() as Record<string, unknown>;
-        const apiKey = String(json.apiKey ?? "").trim();
-        if (!apiKey) {
-          throw new HttpError(400, "MISSING_FIELD", "'apiKey' is required", "Provide a non-empty apiKey");
-        }
-        const hash = await this.hashValue(apiKey);
-        this.setConfigValue("apiKeyHash", hash);
-        this.broadcastLog("auth_bootstrapped", "API key auth enabled");
-        return json200(envelope(command, true, { authEnabled: true }));
-      }
-
-      if (method === "POST" && path === "/auth/rotate") {
-        if (!this.getConfigValue("apiKeyHash")) {
-          throw new HttpError(400, "AUTH_DISABLED", "API key auth not configured", "Call POST /auth/bootstrap");
-        }
-        const json = await request.json() as Record<string, unknown>;
-        const apiKey = String(json.apiKey ?? "").trim();
-        if (!apiKey) {
-          throw new HttpError(400, "MISSING_FIELD", "'apiKey' is required", "Provide a non-empty apiKey");
-        }
-        const hash = await this.hashValue(apiKey);
-        this.setConfigValue("apiKeyHash", hash);
-        this.broadcastLog("auth_rotated", "API key rotated");
-        return json200(envelope(command, true, { rotated: true }));
-      }
-
-      if (method === "GET" && path === "/templates") {
-        return json200(envelope(command, true, { templates: this.getTemplates() }));
-      }
-
-      if (method === "GET" && path === "/config") {
-        const config = this.getConfig();
-        return json200(envelope(command, true, {
-          config,
-          authEnabled: this.getConfigValue("apiKeyHash") !== undefined,
-        }));
-      }
-
-      if (method === "POST" && path === "/config") {
-        const json = await request.json() as Record<string, unknown>;
-        const key = String(json.key ?? "") as keyof Config;
-        const value = json.value as Config[keyof Config];
-        this.setConfig(key, value);
-        this.broadcastLog("config_updated", `Config updated: ${key}`);
-        return json200(envelope(command, true, { key, value }));
-      }
-
-      if (method === "POST" && path === "/demo/failure") {
-        const json = await request.json() as Record<string, unknown>;
-        const enabled = Boolean(json.enabled);
-        this.setConfig("demoFailureMode", enabled);
-        this.broadcastLog("demo_failure_mode", enabled ? "Demo mode set to broken" : "Demo mode set to healthy");
-        return json200(envelope(command, true, { demoFailureMode: enabled }));
-      }
-
-      if (method === "POST" && path === "/demo/bootstrap") {
-        const templates = this.getTemplates();
-        let created = 0;
-        for (const template of templates) {
-          const name = this.gateNameFromAssertion(template.assertion);
-          if (this.getGateByName(name)) {
-            continue;
-          }
-          this.addGate(template.assertion);
-          created += 1;
-        }
-        if (!this.getConfig().targetEndpoint) {
-          this.setConfig("targetEndpoint", url.origin);
-        }
-        this.broadcastLog("demo_bootstrap", `Bootstrapped demo gates: ${created}`, { created });
-        return json200(envelope(command, true, { created, templates: templates.length }));
-      }
-
-      if (method === "GET" && path === "/logs") {
-        const limit = Number(url.searchParams.get("limit") ?? 100);
-        return json200(envelope(command, true, { logs: this.listLogs(limit) }));
-      }
-
-      if (method === "GET" && path === "/runs") {
-        const limit = Number(url.searchParams.get("limit") ?? 25);
-        return json200(envelope(command, true, { runs: this.listRuns(limit) }));
-      }
-
-      if (method === "GET" && path === "/slo") {
-        return json200(envelope(command, true, { slo: this.getSloSummary() }));
-      }
-
-      if (method === "GET" && path === "/proof") {
-        const proof = {
-          generatedAt: new Date().toISOString(),
-          loop: this.getLoopState(),
-          gates: this.listGates(),
-          recentRuns: this.listRuns(30),
-          slo: this.getSloSummary(),
-          config: this.getConfig(),
-        };
-        return json200(envelope(command, true, proof));
-      }
-
-      if (method === "POST" && path === "/run") {
-        const endpoint = this.resolveTargetEndpoint(url.origin);
-        this.bumpIteration();
-        const results = await this.runGates(endpoint);
-        this.broadcastLog("manual_run", "Manual run completed", { endpoint, gates: results.length });
-        return json200(envelope(command, true, { endpoint, results, slo: this.getSloSummary() }));
-      }
-
-      if (method === "POST" && path === "/gates") {
-        const json = await request.json() as Record<string, unknown>;
-        const assertion = json.assertion as string | undefined;
-        const fn = json.fn as string | undefined;
-        const name = json.name as string | undefined;
-        if (!assertion && !fn) {
-          throw new HttpError(400, "MISSING_FIELD", "Either 'assertion' or 'fn' is required", "Provide 'assertion' or 'fn'");
-        }
-
-        const gate = fn ? this.addGate(name ?? assertion ?? "custom", fn) : this.addGate(assertion!);
-        this.broadcastLog("gate_added", `Gate added: ${gate.name}`, { name: gate.name, status: gate.status });
-        return json200(envelope(command, true, gate, undefined, undefined, [
-          { command: "GET /gates", description: "List all gates" },
-          { command: "POST /start", description: "Start the loop" },
-        ]));
-      }
-
-      if (method === "GET" && path === "/gates") {
-        return json200(envelope(command, true, { gates: this.listGates() }, undefined, undefined, [
-          { command: "POST /gates", description: "Add a gate" },
-          { command: "POST /start", description: "Start the loop" },
-        ]));
-      }
-
-      if (method === "DELETE" && path.startsWith("/gates/")) {
-        const name = decodeURIComponent(path.slice("/gates/".length));
-        const removed = this.removeGate(name);
-        if (!removed) {
-          throw new HttpError(404, "NOT_FOUND", "Gate not found");
-        }
-        this.broadcastLog("gate_removed", `Gate removed: ${name}`, { name });
-        return json200(envelope(command, true, { removed: true }, undefined, undefined, [
-          { command: "GET /gates", description: "List remaining gates" },
-        ]));
-      }
-
-      if (method === "POST" && path === "/nudge") {
-        const json = await request.json() as Record<string, unknown>;
-        const text = String(json.text ?? "").trim();
-        if (!text) {
-          throw new HttpError(400, "MISSING_FIELD", "'text' is required", "Provide a non-empty text");
-        }
-        const nudge = this.addNudge(text);
-        this.broadcastLog("nudge_added", "Nudge added", { text });
-        return json200(envelope(command, true, nudge, undefined, undefined, [
-          { command: "GET /status", description: "Check loop status" },
-        ]));
-      }
-
-      if (method === "GET" && path === "/status") {
-        const loop = this.getLoopState();
-        const gates = this.listGates();
-        const summary = {
-          total: gates.length,
-          red: gates.filter(g => g.status === "red").length,
-          green: gates.filter(g => g.status === "green").length,
-          stuck: gates.filter(g => g.status === "stuck").length,
-        };
-        return json200(envelope(command, true, { loop, gates: summary }, undefined, undefined, [
-          { command: "POST /start", description: "Start the loop" },
-          { command: "POST /gates", description: "Add a gate" },
-        ]));
-      }
-
-      if (method === "POST" && path === "/start") {
-        this.startLoop(url.origin);
-        const state = this.getLoopState();
-        this.broadcastLog("loop_started", "Loop started", { status: state.status });
-        return json200(envelope(command, true, state, undefined, undefined, [
-          { command: "GET /status", description: "Check status" },
-          { command: "POST /pause", description: "Pause the loop" },
-        ]));
-      }
-
-      if (method === "POST" && path === "/pause") {
-        this.pauseLoop();
-        const state = this.getLoopState();
-        this.broadcastLog("loop_paused", "Loop paused", { status: state.status });
-        return json200(envelope(command, true, state, undefined, undefined, [
-          { command: "POST /start", description: "Resume the loop" },
-          { command: "GET /status", description: "Check status" },
-        ]));
-      }
-
-      throw new HttpError(404, "NOT_FOUND", "Not found");
-    } catch (err) {
+    app.onError((err, c) => {
+      const command = c.get("command") ?? `${c.req.method} ${c.req.path}`;
       if (err instanceof HttpError) {
         this.broadcastLog("error", `${command} failed: ${err.message}`, { code: err.code });
         return json200(
@@ -430,7 +471,9 @@ export class GreenlightDO extends DurableObject<Env> {
         message,
         code: "INTERNAL_ERROR",
       }), 500);
-    }
+    });
+
+    return app;
   }
 
   override async alarm(): Promise<void> {
