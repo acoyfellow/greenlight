@@ -202,4 +202,91 @@ describe("HTTP API", () => {
       }
     });
   });
+
+  describe("multi-project routing", () => {
+    it("isolates gate state by project", async () => {
+      const projectA = `proj-a-${Date.now()}`;
+      const projectB = `proj-b-${Date.now()}`;
+      const assertion = `GET /api/isolation-${Date.now()} returns 200`;
+
+      await SELF.fetch(`http://localhost/gates?project=${projectA}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ assertion }),
+      });
+
+      const aRes = await SELF.fetch(`http://localhost/gates?project=${projectA}`);
+      const aBody = (await aRes.json()) as Envelope<{ gates: Gate[] }>;
+      expect(aBody.result?.gates.some(g => g.assertion === assertion)).toBe(true);
+
+      const bRes = await SELF.fetch(`http://localhost/gates?project=${projectB}`);
+      const bBody = (await bRes.json()) as Envelope<{ gates: Gate[] }>;
+      expect(bBody.result?.gates.some(g => g.assertion === assertion)).toBe(false);
+    });
+  });
+
+  describe("demo runner and proof endpoints", () => {
+    it("bootstraps demo gates and produces runs, slo, and proof", async () => {
+      const project = `demo-${Date.now()}`;
+
+      const bootstrap = await SELF.fetch(`http://localhost/demo/bootstrap?project=${project}`, {
+        method: "POST",
+      });
+      expect(bootstrap.status).toBe(200);
+
+      const run = await SELF.fetch(`http://localhost/run?project=${project}`, {
+        method: "POST",
+      });
+      expect(run.status).toBe(200);
+
+      const runs = await SELF.fetch(`http://localhost/runs?project=${project}`);
+      const runsBody = (await runs.json()) as Envelope<{ runs: Array<{ pass: boolean }> }>;
+      expect(runsBody.ok).toBe(true);
+      expect((runsBody.result?.runs.length ?? 0) > 0).toBe(true);
+
+      const slo = await SELF.fetch(`http://localhost/slo?project=${project}`);
+      const sloBody = (await slo.json()) as Envelope<{ slo: { totalRuns: number } }>;
+      expect(sloBody.result?.slo.totalRuns).toBeGreaterThan(0);
+
+      const proof = await SELF.fetch(`http://localhost/proof?project=${project}`);
+      const proofBody = (await proof.json()) as Envelope<{
+        gates: Gate[];
+        recentRuns: Array<{ pass: boolean }>;
+      }>;
+      expect(proofBody.ok).toBe(true);
+      expect((proofBody.result?.gates.length ?? 0) > 0).toBe(true);
+      expect((proofBody.result?.recentRuns.length ?? 0) > 0).toBe(true);
+    });
+  });
+
+  describe("api key auth", () => {
+    it("enforces x-api-key after bootstrap", async () => {
+      const project = `auth-${Date.now()}`;
+      const apiKey = "test-key-123";
+
+      const bootstrap = await SELF.fetch(`http://localhost/auth/bootstrap?project=${project}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ apiKey }),
+      });
+      expect(bootstrap.status).toBe(200);
+
+      const noKey = await SELF.fetch(`http://localhost/gates?project=${project}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ assertion: "GET /demo/health returns 200" }),
+      });
+      expect(noKey.status).toBe(401);
+
+      const withKey = await SELF.fetch(`http://localhost/gates?project=${project}`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "x-api-key": apiKey,
+        },
+        body: JSON.stringify({ assertion: "GET /demo/health returns 200" }),
+      });
+      expect(withKey.status).toBe(200);
+    });
+  });
 });

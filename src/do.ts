@@ -1,6 +1,20 @@
 import { DurableObject } from "cloudflare:workers";
-import type { Gate, Memory, Nudge, LoopState, Config, Envelope } from "./types.js";
+import { compileGate } from "./compile.js";
+import type { Config, Envelope, Gate, GateResult, LoopState, Memory, Nudge } from "./types.js";
 import { DEFAULT_CONFIG } from "./types.js";
+
+class HttpError extends Error {
+  status: number;
+  code: string;
+  fix?: string;
+
+  constructor(status: number, code: string, message: string, fix?: string) {
+    super(message);
+    this.status = status;
+    this.code = code;
+    this.fix = fix;
+  }
+}
 
 function envelope<T>(
   command: string,
@@ -26,15 +40,32 @@ function html200(body: string): Response {
   });
 }
 
+function jsonRaw(body: unknown, status = 200): Response {
+  return new Response(JSON.stringify(body), {
+    status,
+    headers: { "content-type": "application/json;charset=UTF-8" },
+  });
+}
+
 export interface Env {
   GREENLIGHT_DO: DurableObjectNamespace<GreenlightDO>;
   AI: Ai;
 }
 
-/**
- * The greenlight Durable Object.
- * One DO per project. SQLite for everything.
- */
+interface SloSummary {
+  totalRuns: number;
+  passRate: number;
+  passRate24h: number;
+  averageDurationMs: number;
+  lastRunAt?: string;
+}
+
+interface Template {
+  name: string;
+  assertion: string;
+  description: string;
+}
+
 export class GreenlightDO extends DurableObject<Env> {
   private sql: SqlStorage;
   private streamSockets = new Set<WebSocket>();
@@ -95,6 +126,34 @@ export class GreenlightDO extends DurableObject<Env> {
         last_run_at TEXT
       )
     `);
+    this.sql.exec(`
+      CREATE TABLE IF NOT EXISTS runs (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        gate_name TEXT,
+        pass INTEGER,
+        error TEXT,
+        duration_ms INTEGER,
+        endpoint TEXT,
+        run_at TEXT,
+        loop_iteration INTEGER
+      )
+    `);
+    this.sql.exec(`
+      CREATE TABLE IF NOT EXISTS rate_limits (
+        bucket TEXT PRIMARY KEY,
+        count INTEGER,
+        window_start INTEGER
+      )
+    `);
+    this.sql.exec(`
+      CREATE TABLE IF NOT EXISTS logs (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        ts TEXT,
+        type TEXT,
+        message TEXT,
+        data TEXT
+      )
+    `);
     const count = [...this.sql.exec(`SELECT COUNT(*) as c FROM loop_state`)][0]!.c as number;
     if (count === 0) {
       this.sql.exec(`INSERT INTO loop_state (status, iteration) VALUES ('idle', 0)`);
@@ -105,8 +164,25 @@ export class GreenlightDO extends DurableObject<Env> {
     const url = new URL(request.url);
     const path = url.pathname;
     const method = request.method;
+    const command = `${method} ${path}`;
 
     try {
+      if (method === "GET" && path === "/demo/health") {
+        const cfg = this.getConfig();
+        if (cfg.demoFailureMode) {
+          return jsonRaw({ ok: false, mode: "broken" }, 500);
+        }
+        return jsonRaw({ ok: true, mode: "healthy" }, 200);
+      }
+
+      if (method === "GET" && path === "/demo/price") {
+        return jsonRaw({ price: 123.45, currency: "USD", cached: true }, 200);
+      }
+
+      if (method === "GET" && path === "/demo/items") {
+        return jsonRaw([{ id: 1 }, { id: 2 }, { id: 3 }], 200);
+      }
+
       if (method === "GET" && path === "/") {
         return html200(this.renderHomePage());
       }
@@ -114,10 +190,7 @@ export class GreenlightDO extends DurableObject<Env> {
       if (method === "GET" && path === "/stream") {
         const upgrade = request.headers.get("Upgrade");
         if (!upgrade || upgrade.toLowerCase() !== "websocket") {
-          return json200(envelope("GET /stream", false, undefined, {
-            message: "Expected websocket upgrade",
-            code: "BAD_REQUEST",
-          }, "Connect with a WebSocket client"), 426);
+          throw new HttpError(426, "BAD_REQUEST", "Expected websocket upgrade", "Connect with a WebSocket client");
         }
 
         const pair = new WebSocketPair();
@@ -125,13 +198,12 @@ export class GreenlightDO extends DurableObject<Env> {
         const server = pair[1];
         server.accept();
         this.streamSockets.add(server);
-        server.addEventListener("close", () => {
-          this.streamSockets.delete(server);
-        });
-        server.addEventListener("error", () => {
-          this.streamSockets.delete(server);
-        });
-
+        server.addEventListener("close", () => this.streamSockets.delete(server));
+        server.addEventListener("error", () => this.streamSockets.delete(server));
+        const logs = this.listLogs(25);
+        for (const log of logs.reverse()) {
+          server.send(JSON.stringify(log));
+        }
         server.send(JSON.stringify({
           ts: new Date().toISOString(),
           type: "stream_connected",
@@ -140,67 +212,171 @@ export class GreenlightDO extends DurableObject<Env> {
         return new Response(null, { status: 101, webSocket: client });
       }
 
+      if (["POST", "PUT", "PATCH", "DELETE"].includes(method) && path !== "/auth/bootstrap") {
+        await this.requireMutationAccess(request);
+      }
+
+      if (method === "GET" && path === "/auth/status") {
+        const authEnabled = this.getConfigValue("apiKeyHash") !== undefined;
+        return json200(envelope(command, true, { authEnabled }));
+      }
+
+      if (method === "POST" && path === "/auth/bootstrap") {
+        if (this.getConfigValue("apiKeyHash")) {
+          throw new HttpError(409, "AUTH_ALREADY_ENABLED", "API key already configured", "Use POST /auth/rotate");
+        }
+        const json = await request.json() as Record<string, unknown>;
+        const apiKey = String(json.apiKey ?? "").trim();
+        if (!apiKey) {
+          throw new HttpError(400, "MISSING_FIELD", "'apiKey' is required", "Provide a non-empty apiKey");
+        }
+        const hash = await this.hashValue(apiKey);
+        this.setConfigValue("apiKeyHash", hash);
+        this.broadcastLog("auth_bootstrapped", "API key auth enabled");
+        return json200(envelope(command, true, { authEnabled: true }));
+      }
+
+      if (method === "POST" && path === "/auth/rotate") {
+        if (!this.getConfigValue("apiKeyHash")) {
+          throw new HttpError(400, "AUTH_DISABLED", "API key auth not configured", "Call POST /auth/bootstrap");
+        }
+        const json = await request.json() as Record<string, unknown>;
+        const apiKey = String(json.apiKey ?? "").trim();
+        if (!apiKey) {
+          throw new HttpError(400, "MISSING_FIELD", "'apiKey' is required", "Provide a non-empty apiKey");
+        }
+        const hash = await this.hashValue(apiKey);
+        this.setConfigValue("apiKeyHash", hash);
+        this.broadcastLog("auth_rotated", "API key rotated");
+        return json200(envelope(command, true, { rotated: true }));
+      }
+
+      if (method === "GET" && path === "/templates") {
+        return json200(envelope(command, true, { templates: this.getTemplates() }));
+      }
+
+      if (method === "GET" && path === "/config") {
+        const config = this.getConfig();
+        return json200(envelope(command, true, {
+          config,
+          authEnabled: this.getConfigValue("apiKeyHash") !== undefined,
+        }));
+      }
+
+      if (method === "POST" && path === "/config") {
+        const json = await request.json() as Record<string, unknown>;
+        const key = String(json.key ?? "") as keyof Config;
+        const value = json.value as Config[keyof Config];
+        this.setConfig(key, value);
+        this.broadcastLog("config_updated", `Config updated: ${key}`);
+        return json200(envelope(command, true, { key, value }));
+      }
+
+      if (method === "POST" && path === "/demo/failure") {
+        const json = await request.json() as Record<string, unknown>;
+        const enabled = Boolean(json.enabled);
+        this.setConfig("demoFailureMode", enabled);
+        this.broadcastLog("demo_failure_mode", enabled ? "Demo mode set to broken" : "Demo mode set to healthy");
+        return json200(envelope(command, true, { demoFailureMode: enabled }));
+      }
+
+      if (method === "POST" && path === "/demo/bootstrap") {
+        const templates = this.getTemplates();
+        let created = 0;
+        for (const template of templates) {
+          const name = this.gateNameFromAssertion(template.assertion);
+          if (this.getGateByName(name)) {
+            continue;
+          }
+          this.addGate(template.assertion);
+          created += 1;
+        }
+        if (!this.getConfig().targetEndpoint) {
+          this.setConfig("targetEndpoint", url.origin);
+        }
+        this.broadcastLog("demo_bootstrap", `Bootstrapped demo gates: ${created}`, { created });
+        return json200(envelope(command, true, { created, templates: templates.length }));
+      }
+
+      if (method === "GET" && path === "/logs") {
+        const limit = Number(url.searchParams.get("limit") ?? 100);
+        return json200(envelope(command, true, { logs: this.listLogs(limit) }));
+      }
+
+      if (method === "GET" && path === "/runs") {
+        const limit = Number(url.searchParams.get("limit") ?? 25);
+        return json200(envelope(command, true, { runs: this.listRuns(limit) }));
+      }
+
+      if (method === "GET" && path === "/slo") {
+        return json200(envelope(command, true, { slo: this.getSloSummary() }));
+      }
+
+      if (method === "GET" && path === "/proof") {
+        const proof = {
+          generatedAt: new Date().toISOString(),
+          loop: this.getLoopState(),
+          gates: this.listGates(),
+          recentRuns: this.listRuns(30),
+          slo: this.getSloSummary(),
+          config: this.getConfig(),
+        };
+        return json200(envelope(command, true, proof));
+      }
+
+      if (method === "POST" && path === "/run") {
+        const endpoint = this.resolveTargetEndpoint(url.origin);
+        this.bumpIteration();
+        const results = await this.runGates(endpoint);
+        this.broadcastLog("manual_run", "Manual run completed", { endpoint, gates: results.length });
+        return json200(envelope(command, true, { endpoint, results, slo: this.getSloSummary() }));
+      }
+
       if (method === "POST" && path === "/gates") {
         const json = await request.json() as Record<string, unknown>;
         const assertion = json.assertion as string | undefined;
         const fn = json.fn as string | undefined;
         const name = json.name as string | undefined;
-
         if (!assertion && !fn) {
-          return json200(envelope("POST /gates", false, undefined, {
-            message: "Either 'assertion' or 'fn' is required",
-            code: "MISSING_FIELD",
-          }, "Provide an 'assertion' string or a 'fn' function body"), 400);
+          throw new HttpError(400, "MISSING_FIELD", "Either 'assertion' or 'fn' is required", "Provide 'assertion' or 'fn'");
         }
 
-        const gate = fn
-          ? this.addGate(name ?? assertion ?? "custom", fn)
-          : this.addGate(assertion!);
-        this.broadcastLog("gate_added", `Gate added: ${gate.name}`, {
-          name: gate.name,
-          status: gate.status,
-        });
-
-        return json200(envelope("POST /gates", true, gate, undefined, undefined, [
+        const gate = fn ? this.addGate(name ?? assertion ?? "custom", fn) : this.addGate(assertion!);
+        this.broadcastLog("gate_added", `Gate added: ${gate.name}`, { name: gate.name, status: gate.status });
+        return json200(envelope(command, true, gate, undefined, undefined, [
           { command: "GET /gates", description: "List all gates" },
           { command: "POST /start", description: "Start the loop" },
         ]));
       }
 
       if (method === "GET" && path === "/gates") {
-        const gates = this.listGates();
-        return json200(envelope("GET /gates", true, { gates }, undefined, undefined, [
+        return json200(envelope(command, true, { gates: this.listGates() }, undefined, undefined, [
           { command: "POST /gates", description: "Add a gate" },
           { command: "POST /start", description: "Start the loop" },
         ]));
       }
 
       if (method === "DELETE" && path.startsWith("/gates/")) {
-        const name = path.slice("/gates/".length);
-        const removed = this.removeGate(decodeURIComponent(name));
+        const name = decodeURIComponent(path.slice("/gates/".length));
+        const removed = this.removeGate(name);
         if (!removed) {
-          return json200(envelope(`DELETE /gates/${name}`, false, undefined, {
-            message: "Gate not found",
-            code: "NOT_FOUND",
-          }), 404);
+          throw new HttpError(404, "NOT_FOUND", "Gate not found");
         }
-        return json200(envelope(`DELETE /gates/${name}`, true, { removed: true }, undefined, undefined, [
+        this.broadcastLog("gate_removed", `Gate removed: ${name}`, { name });
+        return json200(envelope(command, true, { removed: true }, undefined, undefined, [
           { command: "GET /gates", description: "List remaining gates" },
         ]));
       }
 
       if (method === "POST" && path === "/nudge") {
         const json = await request.json() as Record<string, unknown>;
-        const text = json.text as string | undefined;
+        const text = String(json.text ?? "").trim();
         if (!text) {
-          return json200(envelope("POST /nudge", false, undefined, {
-            message: "'text' is required",
-            code: "MISSING_FIELD",
-          }, "Provide a 'text' string"), 400);
+          throw new HttpError(400, "MISSING_FIELD", "'text' is required", "Provide a non-empty text");
         }
         const nudge = this.addNudge(text);
         this.broadcastLog("nudge_added", "Nudge added", { text });
-        return json200(envelope("POST /nudge", true, nudge, undefined, undefined, [
+        return json200(envelope(command, true, nudge, undefined, undefined, [
           { command: "GET /status", description: "Check loop status" },
         ]));
       }
@@ -214,17 +390,17 @@ export class GreenlightDO extends DurableObject<Env> {
           green: gates.filter(g => g.status === "green").length,
           stuck: gates.filter(g => g.status === "stuck").length,
         };
-        return json200(envelope("GET /status", true, { loop, gates: summary }, undefined, undefined, [
+        return json200(envelope(command, true, { loop, gates: summary }, undefined, undefined, [
           { command: "POST /start", description: "Start the loop" },
           { command: "POST /gates", description: "Add a gate" },
         ]));
       }
 
       if (method === "POST" && path === "/start") {
-        this.startLoop();
+        this.startLoop(url.origin);
         const state = this.getLoopState();
         this.broadcastLog("loop_started", "Loop started", { status: state.status });
-        return json200(envelope("POST /start", true, state, undefined, undefined, [
+        return json200(envelope(command, true, state, undefined, undefined, [
           { command: "GET /status", description: "Check status" },
           { command: "POST /pause", description: "Pause the loop" },
         ]));
@@ -234,70 +410,88 @@ export class GreenlightDO extends DurableObject<Env> {
         this.pauseLoop();
         const state = this.getLoopState();
         this.broadcastLog("loop_paused", "Loop paused", { status: state.status });
-        return json200(envelope("POST /pause", true, state, undefined, undefined, [
+        return json200(envelope(command, true, state, undefined, undefined, [
           { command: "POST /start", description: "Resume the loop" },
           { command: "GET /status", description: "Check status" },
         ]));
       }
 
-      return json200(envelope(`${method} ${path}`, false, undefined, {
-        message: "Not found",
-        code: "NOT_FOUND",
-      }), 404);
+      throw new HttpError(404, "NOT_FOUND", "Not found");
     } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      this.broadcastLog("error", `Request failed: ${method} ${path}`, { error: msg });
-      return json200(envelope(`${method} ${path}`, false, undefined, {
-        message: msg,
+      if (err instanceof HttpError) {
+        this.broadcastLog("error", `${command} failed: ${err.message}`, { code: err.code });
+        return json200(
+          envelope(command, false, undefined, { message: err.message, code: err.code }, err.fix),
+          err.status
+        );
+      }
+      const message = err instanceof Error ? err.message : String(err);
+      this.broadcastLog("error", `${command} failed: ${message}`);
+      return json200(envelope(command, false, undefined, {
+        message,
         code: "INTERNAL_ERROR",
       }), 500);
     }
   }
 
   override async alarm(): Promise<void> {
-    const state = this.getLoopState();
-    if (state.status !== "running") {
+    const loop = this.getLoopState();
+    if (loop.status !== "running") {
       return;
     }
 
-    const now = new Date().toISOString();
-    this.sql.exec(
-      `UPDATE loop_state SET iteration = iteration + 1, last_run_at = ?`,
-      now
-    );
-    const iteration = [...this.sql.exec(`SELECT iteration FROM loop_state`)][0]!.iteration as number;
-    this.broadcastLog(
-      "loop_tick",
-      "Loop tick complete; gate execution engine not implemented yet",
-      { iteration }
-    );
+    try {
+      this.bumpIteration();
+      const endpoint = this.resolveTargetEndpoint();
+      const results = await this.runGates(endpoint);
+      const gates = this.listGates();
+      const hasStuck = gates.some(g => g.status === "stuck");
+      const allGreen = gates.length > 0 && gates.every(g => g.status === "green");
 
-    const config = this.getConfig();
-    this.ctx.storage.setAlarm(Date.now() + config.loopInterval * 1000);
+      if (allGreen) {
+        this.sql.exec(`UPDATE loop_state SET status = 'done'`);
+        this.ctx.storage.deleteAlarm();
+        this.broadcastLog("loop_done", "All gates green", { gates: gates.length });
+        return;
+      }
+
+      if (hasStuck) {
+        this.sql.exec(`UPDATE loop_state SET status = 'paused'`);
+        this.ctx.storage.deleteAlarm();
+        this.broadcastLog("loop_stuck", "Loop paused due to stuck gate");
+        return;
+      }
+
+      const cfg = this.getConfig();
+      this.ctx.storage.setAlarm(Date.now() + cfg.loopInterval * 1000);
+      this.broadcastLog("loop_tick", "Loop tick completed", {
+        iteration: this.getLoopState().iteration,
+        passing: results.filter(r => r.pass).length,
+        total: results.length,
+      });
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      this.broadcastLog("loop_error", `Alarm failed: ${message}`);
+      this.sql.exec(`UPDATE loop_state SET status = 'paused'`);
+      this.ctx.storage.deleteAlarm();
+    }
   }
-
-  // --- Gate CRUD ---
 
   addGate(assertion: string, fn?: string): Gate {
     const now = new Date().toISOString();
-    let name: string;
-
-    if (fn) {
-      name = assertion;
-    } else {
-      name = assertion
-        .toLowerCase()
-        .replace(/[^a-z0-9]+/g, "-")
-        .replace(/^-+|-+$/g, "");
-    }
-
+    const name = fn ? assertion : this.gateNameFromAssertion(assertion);
     const maxOrder = [...this.sql.exec(`SELECT MAX("order") as m FROM gates`)][0]!.m as number | null;
     const order = (maxOrder ?? -1) + 1;
 
     this.sql.exec(
       `INSERT INTO gates (name, assertion, fn, status, iterations, "order", created_at, updated_at)
        VALUES (?, ?, ?, 'red', 0, ?, ?, ?)`,
-      name, assertion, fn ?? null, order, now, now
+      name,
+      assertion,
+      fn ?? null,
+      order,
+      now,
+      now
     );
 
     return {
@@ -335,25 +529,97 @@ export class GreenlightDO extends DurableObject<Env> {
     }));
   }
 
-  // --- Gate Execution ---
+  async runGates(endpoint: string): Promise<GateResult[]> {
+    const gates = this.listGates();
+    const config = this.getConfig();
+    const iteration = this.getLoopState().iteration;
+    const results: GateResult[] = [];
 
-  async runGates(_endpoint: string): Promise<import("./types.js").GateResult[]> {
-    throw new Error("not implemented");
+    for (const gate of gates) {
+      const started = Date.now();
+      let pass = true;
+      let error: string | undefined;
+
+      try {
+        await this.executeGate(gate, endpoint);
+      } catch (err) {
+        pass = false;
+        error = err instanceof Error ? err.message : String(err);
+      }
+
+      const durationMs = Date.now() - started;
+      const attempts = gate.iterations + 1;
+      const nextStatus: Gate["status"] = pass
+        ? "green"
+        : (attempts >= config.maxIterations ? "stuck" : "red");
+      const now = new Date().toISOString();
+
+      this.sql.exec(
+        `UPDATE gates
+         SET status = ?, last_error = ?, iterations = ?, updated_at = ?
+         WHERE name = ?`,
+        nextStatus,
+        pass ? null : error ?? "unknown error",
+        attempts,
+        now,
+        gate.name
+      );
+
+      this.sql.exec(
+        `INSERT INTO runs (gate_name, pass, error, duration_ms, endpoint, run_at, loop_iteration)
+         VALUES (?, ?, ?, ?, ?, ?, ?)`,
+        gate.name,
+        pass ? 1 : 0,
+        pass ? null : error ?? "unknown error",
+        durationMs,
+        endpoint,
+        now,
+        iteration
+      );
+
+      if (gate.status === "green" && !pass) {
+        this.broadcastLog("gate_regression", `Gate regressed: ${gate.name}`, { error });
+        this.ctx.waitUntil(this.sendAlert({
+          kind: "gate_regression",
+          gate: gate.name,
+          error,
+          endpoint,
+        }));
+      }
+      if (gate.status !== "green" && pass) {
+        this.broadcastLog("gate_recovered", `Gate recovered: ${gate.name}`);
+      }
+      if (!pass && nextStatus === "stuck") {
+        this.broadcastLog("gate_stuck", `Gate stuck: ${gate.name}`, { error });
+      }
+
+      results.push({
+        name: gate.name,
+        pass,
+        error,
+        durationMs,
+      });
+    }
+
+    return results;
   }
-
-  // --- Memory ---
 
   recordMemory(trigger: string, learning: string, source: Memory["source"]): Memory {
     const now = new Date().toISOString();
     this.sql.exec(
       `INSERT INTO memories (trigger, learning, source, created_at) VALUES (?, ?, ?, ?)`,
-      trigger, learning, source, now
+      trigger,
+      learning,
+      source,
+      now
     );
     const row = [...this.sql.exec(`SELECT last_insert_rowid() as id`)][0]!;
     const id = row.id as number;
     this.sql.exec(
       `INSERT INTO memories_fts (rowid, trigger, learning) VALUES (?, ?, ?)`,
-      id, trigger, learning
+      id,
+      trigger,
+      learning
     );
     return { id, trigger, learning, source, createdAt: now };
   }
@@ -366,7 +632,8 @@ export class GreenlightDO extends DurableObject<Env> {
        JOIN memories m ON m.id = f.rowid
        WHERE memories_fts MATCH ?
        LIMIT ?`,
-      search, lim
+      search,
+      lim
     )];
     return rows.map(r => ({
       id: r.id as number,
@@ -377,13 +644,12 @@ export class GreenlightDO extends DurableObject<Env> {
     }));
   }
 
-  // --- Nudges ---
-
   addNudge(text: string): Nudge {
     const now = new Date().toISOString();
     this.sql.exec(
       `INSERT INTO nudges (text, consumed, created_at) VALUES (?, 0, ?)`,
-      text, now
+      text,
+      now
     );
     const row = [...this.sql.exec(`SELECT last_insert_rowid() as id`)][0]!;
     const id = row.id as number;
@@ -403,34 +669,36 @@ export class GreenlightDO extends DurableObject<Env> {
     }));
   }
 
-  // --- Config ---
-
   getConfig(): Config {
-    const rows = [...this.sql.exec(`SELECT key, value FROM config`)];
-    const overrides: Record<string, string> = {};
-    for (const r of rows) {
-      overrides[r.key as string] = r.value as string;
-    }
+    const read = (key: keyof Config): string | undefined => this.getConfigValue(key);
     return {
-      model: overrides.model ?? DEFAULT_CONFIG.model,
-      maxIterations: overrides.maxIterations !== undefined ? Number(overrides.maxIterations) : DEFAULT_CONFIG.maxIterations,
-      loopInterval: overrides.loopInterval !== undefined ? Number(overrides.loopInterval) : DEFAULT_CONFIG.loopInterval,
-      autoPublish: overrides.autoPublish !== undefined ? overrides.autoPublish === "true" : DEFAULT_CONFIG.autoPublish,
+      model: read("model") ?? DEFAULT_CONFIG.model,
+      maxIterations: Number(read("maxIterations") ?? DEFAULT_CONFIG.maxIterations),
+      loopInterval: Number(read("loopInterval") ?? DEFAULT_CONFIG.loopInterval),
+      autoPublish: (read("autoPublish") ?? String(DEFAULT_CONFIG.autoPublish)) === "true",
+      targetEndpoint: read("targetEndpoint") ?? DEFAULT_CONFIG.targetEndpoint,
+      rateLimitPerMinute: Number(read("rateLimitPerMinute") ?? DEFAULT_CONFIG.rateLimitPerMinute),
+      alertWebhookUrl: read("alertWebhookUrl") ?? DEFAULT_CONFIG.alertWebhookUrl,
+      demoFailureMode: (read("demoFailureMode") ?? String(DEFAULT_CONFIG.demoFailureMode)) === "true",
     };
   }
 
   setConfig(key: keyof Config, value: Config[keyof Config]): void {
-    const validKeys: ReadonlyArray<string> = ["model", "maxIterations", "loopInterval", "autoPublish"];
+    const validKeys: ReadonlyArray<string> = [
+      "model",
+      "maxIterations",
+      "loopInterval",
+      "autoPublish",
+      "targetEndpoint",
+      "rateLimitPerMinute",
+      "alertWebhookUrl",
+      "demoFailureMode",
+    ];
     if (!validKeys.includes(key)) {
       throw new Error(`Unknown config key: ${key}`);
     }
-    this.sql.exec(
-      `INSERT OR REPLACE INTO config (key, value) VALUES (?, ?)`,
-      key, String(value)
-    );
+    this.setConfigValue(key, String(value));
   }
-
-  // --- Loop ---
 
   getLoopState(): LoopState {
     const row = [...this.sql.exec(`SELECT * FROM loop_state`)][0]!;
@@ -441,14 +709,17 @@ export class GreenlightDO extends DurableObject<Env> {
     };
   }
 
-  startLoop(): void {
+  startLoop(origin = "http://localhost"): void {
     const gates = this.listGates();
     if (gates.length === 0) {
       throw new Error("Cannot start loop without gates");
     }
+    if (!this.getConfig().targetEndpoint) {
+      this.setConfig("targetEndpoint", origin);
+    }
     this.sql.exec(`UPDATE loop_state SET status = 'running'`);
-    const config = this.getConfig();
-    this.ctx.storage.setAlarm(Date.now() + config.loopInterval * 1000);
+    const cfg = this.getConfig();
+    this.ctx.storage.setAlarm(Date.now() + cfg.loopInterval * 1000);
   }
 
   pauseLoop(): void {
@@ -460,22 +731,266 @@ export class GreenlightDO extends DurableObject<Env> {
     this.ctx.storage.deleteAlarm();
   }
 
-  private broadcastLog(type: string, message: string, data?: Record<string, unknown>): void {
-    if (this.streamSockets.size === 0) {
+  private getTemplates(): Template[] {
+    return [
+      {
+        name: "demo-health",
+        assertion: "GET /demo/health returns 200",
+        description: "Health endpoint should stay up",
+      },
+      {
+        name: "demo-price-type",
+        assertion: "GET /demo/price -> .price is a number",
+        description: "Price must be numeric",
+      },
+      {
+        name: "demo-currency",
+        assertion: "GET /demo/price -> .currency equals USD",
+        description: "Currency contract check",
+      },
+      {
+        name: "demo-items",
+        assertion: "GET /demo/items -> response is array with length > 2",
+        description: "Array contract check",
+      },
+    ];
+  }
+
+  private resolveTargetEndpoint(origin?: string): string {
+    const cfg = this.getConfig();
+    if (cfg.targetEndpoint) {
+      return cfg.targetEndpoint;
+    }
+    if (origin) {
+      return origin;
+    }
+    throw new Error("No target endpoint configured");
+  }
+
+  private async executeGate(gate: Gate, endpoint: string): Promise<void> {
+    if (gate.fn) {
+      if (gate.fn.includes("export default")) {
+        const source = gate.fn.replace(/export\s+default\s+/, "return ");
+        const factory = new Function(source) as () => (endpoint: string) => Promise<void>;
+        const fn = factory();
+        await fn(endpoint);
+        return;
+      }
+      const fn = new Function("endpoint", `return (async (endpoint) => { ${gate.fn} })(endpoint);`) as (endpoint: string) => Promise<void>;
+      await fn(endpoint);
       return;
     }
-    const payload = JSON.stringify({
+
+    const body = compileGate(gate.assertion);
+    const fn = new Function("endpoint", `return (async () => { ${body} })();`) as (endpoint: string) => Promise<void>;
+    await fn(endpoint);
+  }
+
+  private listRuns(limit: number): Array<{
+    id: number;
+    gate: string;
+    pass: boolean;
+    error?: string;
+    durationMs: number;
+    endpoint: string;
+    runAt: string;
+    iteration: number;
+  }> {
+    const lim = Number.isFinite(limit) && limit > 0 ? Math.min(limit, 200) : 25;
+    const rows = [...this.sql.exec(`SELECT * FROM runs ORDER BY id DESC LIMIT ?`, lim)];
+    return rows.map(row => ({
+      id: row.id as number,
+      gate: row.gate_name as string,
+      pass: Number(row.pass) === 1,
+      error: row.error as string | undefined ?? undefined,
+      durationMs: row.duration_ms as number,
+      endpoint: row.endpoint as string,
+      runAt: row.run_at as string,
+      iteration: row.loop_iteration as number,
+    }));
+  }
+
+  private getSloSummary(): SloSummary {
+    const all = [...this.sql.exec(
+      `SELECT
+         COUNT(*) as total,
+         SUM(CASE WHEN pass = 1 THEN 1 ELSE 0 END) as passed,
+         AVG(duration_ms) as avg_duration,
+         MAX(run_at) as last_run_at
+       FROM runs`
+    )][0]!;
+    const cutoff = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
+    const d24 = [...this.sql.exec(
+      `SELECT
+         COUNT(*) as total,
+         SUM(CASE WHEN pass = 1 THEN 1 ELSE 0 END) as passed
+       FROM runs
+       WHERE run_at >= ?`,
+      cutoff
+    )][0]!;
+
+    const total = Number(all.total ?? 0);
+    const passed = Number(all.passed ?? 0);
+    const total24 = Number(d24.total ?? 0);
+    const passed24 = Number(d24.passed ?? 0);
+
+    return {
+      totalRuns: total,
+      passRate: total === 0 ? 0 : Number(((passed / total) * 100).toFixed(2)),
+      passRate24h: total24 === 0 ? 0 : Number(((passed24 / total24) * 100).toFixed(2)),
+      averageDurationMs: total === 0 ? 0 : Number((Number(all.avg_duration ?? 0)).toFixed(2)),
+      lastRunAt: all.last_run_at as string | undefined ?? undefined,
+    };
+  }
+
+  private listLogs(limit: number): Array<{ ts: string; type: string; message: string; data?: unknown }> {
+    const lim = Number.isFinite(limit) && limit > 0 ? Math.min(limit, 500) : 100;
+    const rows = [...this.sql.exec(`SELECT * FROM logs ORDER BY id DESC LIMIT ?`, lim)];
+    return rows.map(row => ({
+      ts: row.ts as string,
+      type: row.type as string,
+      message: row.message as string,
+      data: row.data ? JSON.parse(row.data as string) : undefined,
+    }));
+  }
+
+  private broadcastLog(type: string, message: string, data?: Record<string, unknown>): void {
+    const payload = {
       ts: new Date().toISOString(),
       type,
       message,
       data,
-    });
+    };
+    this.sql.exec(
+      `INSERT INTO logs (ts, type, message, data) VALUES (?, ?, ?, ?)`,
+      payload.ts,
+      payload.type,
+      payload.message,
+      data ? JSON.stringify(data) : null
+    );
+
+    const encoded = JSON.stringify(payload);
     for (const socket of this.streamSockets) {
       try {
-        socket.send(payload);
+        socket.send(encoded);
       } catch {
         this.streamSockets.delete(socket);
       }
+    }
+  }
+
+  private bumpIteration(): void {
+    this.sql.exec(
+      `UPDATE loop_state SET iteration = iteration + 1, last_run_at = ?`,
+      new Date().toISOString()
+    );
+  }
+
+  private getGateByName(name: string): Gate | undefined {
+    const rows = [...this.sql.exec(`SELECT * FROM gates WHERE name = ?`, name)];
+    if (rows.length === 0) {
+      return undefined;
+    }
+    const row = rows[0]!;
+    return {
+      name: row.name as string,
+      assertion: row.assertion as string,
+      fn: row.fn as string | undefined ?? undefined,
+      status: row.status as Gate["status"],
+      lastError: row.last_error as string | undefined ?? undefined,
+      iterations: row.iterations as number,
+      order: row.order as number,
+      dependsOn: row.depends_on as string | undefined ?? undefined,
+      createdAt: row.created_at as string,
+      updatedAt: row.updated_at as string,
+    };
+  }
+
+  private gateNameFromAssertion(assertion: string): string {
+    return assertion
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/g, "-")
+      .replace(/^-+|-+$/g, "");
+  }
+
+  private getConfigValue(key: string): string | undefined {
+    const rows = [...this.sql.exec(`SELECT value FROM config WHERE key = ?`, key)];
+    if (rows.length === 0) return undefined;
+    return rows[0]!.value as string;
+  }
+
+  private setConfigValue(key: string, value: string): void {
+    this.sql.exec(`INSERT OR REPLACE INTO config (key, value) VALUES (?, ?)`, key, value);
+  }
+
+  private async hashValue(value: string): Promise<string> {
+    const bytes = new TextEncoder().encode(value);
+    const digest = await crypto.subtle.digest("SHA-256", bytes);
+    return [...new Uint8Array(digest)].map(b => b.toString(16).padStart(2, "0")).join("");
+  }
+
+  private async requireMutationAccess(request: Request): Promise<void> {
+    this.enforceRateLimit(request);
+    const apiKeyHash = this.getConfigValue("apiKeyHash");
+    if (!apiKeyHash) {
+      return;
+    }
+    const provided = request.headers.get("x-api-key");
+    if (!provided) {
+      throw new HttpError(401, "AUTH_REQUIRED", "Missing x-api-key header", "Provide x-api-key");
+    }
+    const providedHash = await this.hashValue(provided);
+    if (providedHash !== apiKeyHash) {
+      throw new HttpError(403, "AUTH_INVALID", "Invalid API key");
+    }
+  }
+
+  private enforceRateLimit(request: Request): void {
+    const cfg = this.getConfig();
+    const now = Date.now();
+    const minute = Math.floor(now / 60000);
+    const subject = request.headers.get("cf-connecting-ip")
+      ?? request.headers.get("x-forwarded-for")
+      ?? "anonymous";
+    const bucket = `${subject}:${minute}`;
+
+    const row = [...this.sql.exec(
+      `SELECT count FROM rate_limits WHERE bucket = ?`,
+      bucket
+    )][0];
+
+    if (!row) {
+      this.sql.exec(
+        `INSERT INTO rate_limits (bucket, count, window_start) VALUES (?, 1, ?)`,
+        bucket,
+        minute
+      );
+      return;
+    }
+
+    const count = row.count as number;
+    if (count >= cfg.rateLimitPerMinute) {
+      throw new HttpError(429, "RATE_LIMITED", "Rate limit exceeded", "Retry next minute");
+    }
+    this.sql.exec(`UPDATE rate_limits SET count = count + 1 WHERE bucket = ?`, bucket);
+  }
+
+  private async sendAlert(payload: Record<string, unknown>): Promise<void> {
+    const cfg = this.getConfig();
+    if (!cfg.alertWebhookUrl) {
+      return;
+    }
+    const response = await fetch(cfg.alertWebhookUrl, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        service: "greenlight",
+        ts: new Date().toISOString(),
+        ...payload,
+      }),
+    });
+    if (!response.ok) {
+      throw new Error(`Alert webhook failed with status ${response.status}`);
     }
   }
 
@@ -490,61 +1005,109 @@ export class GreenlightDO extends DurableObject<Env> {
     :root { color-scheme: dark; }
     * { box-sizing: border-box; font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; }
     body { margin: 0; background: #0b1020; color: #dbe4ff; }
-    main { max-width: 980px; margin: 0 auto; padding: 24px; display: grid; gap: 16px; }
-    .card { background: #131a31; border: 1px solid #2a3359; border-radius: 12px; padding: 16px; }
-    h1 { margin: 0 0 4px; font-size: 26px; }
-    p { margin: 0; color: #aeb9e6; }
-    form { display: flex; gap: 8px; margin-top: 10px; }
-    input { flex: 1; min-width: 0; border-radius: 8px; border: 1px solid #36406d; background: #0c1330; color: #eff4ff; padding: 10px 12px; }
-    button { border: 1px solid #3f4d86; background: #1c2750; color: #eff4ff; border-radius: 8px; padding: 10px 12px; cursor: pointer; font-weight: 600; }
-    button:hover { background: #243366; }
+    main { max-width: 1200px; margin: 0 auto; padding: 24px; display: grid; gap: 14px; }
+    .card { background: #111a33; border: 1px solid #28345f; border-radius: 12px; padding: 14px; }
+    .header { display: grid; gap: 8px; }
+    h1 { margin: 0; font-size: 28px; }
+    p { margin: 0; color: #aab6df; }
+    .muted { color: #8ea0d8; font-size: 12px; }
+    .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+    @media (max-width: 980px) { .grid { grid-template-columns: 1fr; } }
+    .row { display: flex; align-items: center; justify-content: space-between; gap: 8px; flex-wrap: wrap; }
+    .controls { display: flex; gap: 8px; flex-wrap: wrap; }
+    form { display: flex; gap: 8px; margin-top: 8px; }
+    input, select { flex: 1; min-width: 0; border-radius: 8px; border: 1px solid #34467a; background: #0b1431; color: #eef3ff; padding: 10px; }
+    button { border: 1px solid #3e5190; background: #1b2a59; color: #eef3ff; border-radius: 8px; padding: 10px 12px; cursor: pointer; font-weight: 600; }
+    button:hover { background: #253977; }
     button:disabled { opacity: 0.6; cursor: wait; }
-    .row { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-bottom: 10px; }
-    .status { font-weight: 700; color: #7dd3fc; }
-    .gates { list-style: none; margin: 0; padding: 0; display: grid; gap: 8px; }
-    .gate { display: flex; align-items: center; gap: 8px; padding: 8px; border: 1px solid #2a3359; border-radius: 8px; background: #0f1734; }
+    .gates, .runs, .templates { list-style: none; margin: 8px 0 0; padding: 0; display: grid; gap: 6px; }
+    .item { border: 1px solid #263359; border-radius: 8px; padding: 8px; background: #0d1838; display: flex; gap: 8px; align-items: center; }
     .dot { width: 10px; height: 10px; border-radius: 999px; flex: 0 0 10px; }
     .dot.red { background: #ef4444; }
     .dot.green { background: #22c55e; }
     .dot.stuck { background: #f59e0b; }
-    .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; font-size: 12px; white-space: pre-wrap; margin: 0; max-height: 260px; overflow: auto; }
-    .muted { color: #9aa7d8; font-size: 12px; }
+    .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; font-size: 12px; white-space: pre-wrap; margin: 0; max-height: 240px; overflow: auto; }
+    .chip { border: 1px solid #32467d; border-radius: 999px; padding: 4px 8px; font-size: 12px; }
+    .ok { color: #86efac; }
+    .bad { color: #fda4af; }
   </style>
 </head>
 <body>
   <main>
-    <section class="card">
+    <section class="card header">
       <h1>greenlight</h1>
-      <p>Add gates, send nudges, start or pause loop, watch live stream.</p>
+      <p>Verifiable gate runner. Multi-project, live logs, run history, SLO, proof bundle.</p>
+      <div class="row">
+        <div class="controls">
+          <span id="projectLabel" class="chip">project: default</span>
+          <span id="loopChip" class="chip">loop: idle</span>
+          <span id="streamState" class="chip">stream: connecting</span>
+        </div>
+        <div class="controls">
+          <button id="toggleLoopBtn" type="button">Start</button>
+          <button id="runNowBtn" type="button">Run now</button>
+          <button id="proofBtn" type="button">Download proof</button>
+        </div>
+      </div>
+      <form id="apiKeyForm">
+        <input id="apiKeyInput" placeholder="Optional API key (x-api-key)" />
+        <button type="submit">Save key</button>
+      </form>
+      <div class="muted" id="authState">auth: unknown</div>
     </section>
 
     <section class="card">
-      <div class="row">
-        <strong>Loop status: <span id="loopStatus" class="status">idle</span></strong>
-        <button id="toggleLoopBtn" type="button">Start</button>
-      </div>
       <form id="gateForm">
-        <input id="gateInput" placeholder="GET /api/price returns 200" required />
+        <input id="gateInput" placeholder="GET /demo/health returns 200" required />
         <button type="submit">Add gate</button>
       </form>
       <form id="nudgeForm">
-        <input id="nudgeInput" placeholder="Use CoinGecko API" required />
+        <input id="nudgeInput" placeholder="Use deterministic response schema" required />
         <button type="submit">Send nudge</button>
       </form>
+      <div class="row" style="margin-top:8px;">
+        <div class="controls">
+          <button id="bootstrapDemoBtn" type="button">Bootstrap demo gates</button>
+          <button id="toggleDemoFailureBtn" type="button">Break demo endpoint</button>
+        </div>
+        <span id="gateCount" class="muted">gates: 0</span>
+      </div>
     </section>
 
-    <section class="card">
-      <div class="row">
-        <strong>Gates</strong>
-        <span id="gateCount" class="muted">0</span>
-      </div>
-      <ul id="gatesList" class="gates"></ul>
+    <section class="grid">
+      <section class="card">
+        <div class="row">
+          <strong>Gates</strong>
+        </div>
+        <ul id="gatesList" class="gates"></ul>
+      </section>
+      <section class="card">
+        <div class="row">
+          <strong>Templates</strong>
+        </div>
+        <ul id="templateList" class="templates"></ul>
+      </section>
+    </section>
+
+    <section class="grid">
+      <section class="card">
+        <div class="row">
+          <strong>Recent runs</strong>
+          <span id="runCount" class="muted">0</span>
+        </div>
+        <ul id="runList" class="runs"></ul>
+      </section>
+      <section class="card">
+        <div class="row">
+          <strong>SLO dashboard</strong>
+        </div>
+        <div id="sloPanel" class="mono"></div>
+      </section>
     </section>
 
     <section class="card">
       <div class="row">
         <strong>Live log stream</strong>
-        <span id="streamState" class="muted">connecting...</span>
       </div>
       <pre id="logPanel" class="mono"></pre>
     </section>
@@ -552,28 +1115,64 @@ export class GreenlightDO extends DurableObject<Env> {
 
   <script>
     (() => {
-      const gateForm = document.getElementById("gateForm");
-      const nudgeForm = document.getElementById("nudgeForm");
-      const gateInput = document.getElementById("gateInput");
-      const nudgeInput = document.getElementById("nudgeInput");
-      const gatesList = document.getElementById("gatesList");
-      const gateCount = document.getElementById("gateCount");
-      const loopStatus = document.getElementById("loopStatus");
-      const toggleLoopBtn = document.getElementById("toggleLoopBtn");
-      const streamState = document.getElementById("streamState");
-      const logPanel = document.getElementById("logPanel");
+      const params = new URLSearchParams(location.search);
+      const project = params.get("project") || "default";
+      const scopedSuffix = location.search ? (location.search.startsWith("?") ? location.search : "?" + location.search) : "";
 
       const state = {
+        project,
         loop: "idle",
         gates: [],
+        runs: [],
+        templates: [],
+        demoFailureMode: false,
+        slo: null,
+        authEnabled: false,
+        apiKey: localStorage.getItem("greenlight_api_key") || "",
+      };
+
+      const $ = (id) => document.getElementById(id);
+      const gateForm = $("gateForm");
+      const nudgeForm = $("nudgeForm");
+      const apiKeyForm = $("apiKeyForm");
+      const gateInput = $("gateInput");
+      const nudgeInput = $("nudgeInput");
+      const apiKeyInput = $("apiKeyInput");
+      const gatesList = $("gatesList");
+      const gateCount = $("gateCount");
+      const runList = $("runList");
+      const runCount = $("runCount");
+      const sloPanel = $("sloPanel");
+      const logPanel = $("logPanel");
+      const streamState = $("streamState");
+      const projectLabel = $("projectLabel");
+      const loopChip = $("loopChip");
+      const authState = $("authState");
+      const templateList = $("templateList");
+      const toggleLoopBtn = $("toggleLoopBtn");
+      const toggleDemoFailureBtn = $("toggleDemoFailureBtn");
+      const runNowBtn = $("runNowBtn");
+      const bootstrapDemoBtn = $("bootstrapDemoBtn");
+      const proofBtn = $("proofBtn");
+
+      apiKeyInput.value = state.apiKey;
+      projectLabel.textContent = "project: " + state.project;
+
+      const scopedPath = (path) => path + (scopedSuffix ? (path.includes("?") ? "&" : "?") + scopedSuffix.slice(1) : "");
+
+      const authHeaders = (contentType) => {
+        const headers = {};
+        if (contentType) headers["content-type"] = contentType;
+        if (state.apiKey) headers["x-api-key"] = state.apiKey;
+        return headers;
       };
 
       const addLog = (line) => {
         const stamp = new Date().toISOString();
         const next = "[" + stamp + "] " + line + "\\n";
         logPanel.textContent = next + logPanel.textContent;
-        if (logPanel.textContent.length > 8000) {
-          logPanel.textContent = logPanel.textContent.slice(0, 8000);
+        if (logPanel.textContent.length > 14000) {
+          logPanel.textContent = logPanel.textContent.slice(0, 14000);
         }
       };
 
@@ -583,67 +1182,133 @@ export class GreenlightDO extends DurableObject<Env> {
         return "red";
       };
 
-      const renderGates = () => {
-        gatesList.innerHTML = "";
-        gateCount.textContent = String(state.gates.length);
-        for (const gate of state.gates) {
-          const item = document.createElement("li");
-          item.className = "gate";
-
-          const dot = document.createElement("span");
-          dot.className = "dot " + gateDot(gate.status);
-          item.appendChild(dot);
-
-          const text = document.createElement("span");
-          text.textContent = gate.name + " - " + gate.assertion;
-          item.appendChild(text);
-
-          gatesList.appendChild(item);
-        }
-      };
-
-      const renderLoop = () => {
-        loopStatus.textContent = state.loop;
-        toggleLoopBtn.textContent = state.loop === "running" ? "Pause" : "Start";
-      };
-
-      const request = async (path, init) => {
-        const res = await fetch(path, init);
+      const request = async (path, init = {}) => {
+        const res = await fetch(scopedPath(path), init);
         const body = await res.json();
-        if (!body.ok) {
-          throw new Error(body.error && body.error.message ? body.error.message : "Request failed");
-        }
+        if (!body.ok) throw new Error(body.error && body.error.message ? body.error.message : "request failed");
         return body;
       };
 
+      const renderGates = () => {
+        gatesList.innerHTML = "";
+        gateCount.textContent = "gates: " + state.gates.length;
+        for (const gate of state.gates) {
+          const li = document.createElement("li");
+          li.className = "item";
+          const dot = document.createElement("span");
+          dot.className = "dot " + gateDot(gate.status);
+          li.appendChild(dot);
+          const span = document.createElement("span");
+          span.textContent = gate.name + " - " + gate.assertion;
+          li.appendChild(span);
+          gatesList.appendChild(li);
+        }
+      };
+
+      const renderRuns = () => {
+        runList.innerHTML = "";
+        runCount.textContent = String(state.runs.length);
+        for (const run of state.runs) {
+          const li = document.createElement("li");
+          li.className = "item";
+          const dot = document.createElement("span");
+          dot.className = "dot " + (run.pass ? "green" : "red");
+          li.appendChild(dot);
+          const span = document.createElement("span");
+          span.textContent = run.gate + " - " + (run.pass ? "pass" : "fail") + " - " + run.durationMs + "ms";
+          li.appendChild(span);
+          runList.appendChild(li);
+        }
+      };
+
+      const renderTemplates = () => {
+        templateList.innerHTML = "";
+        for (const template of state.templates) {
+          const li = document.createElement("li");
+          li.className = "item";
+          const title = document.createElement("span");
+          title.textContent = template.assertion;
+          li.appendChild(title);
+          const btn = document.createElement("button");
+          btn.type = "button";
+          btn.textContent = "Use";
+          btn.addEventListener("click", async () => {
+            gateInput.value = template.assertion;
+            gateInput.focus();
+          });
+          li.appendChild(btn);
+          templateList.appendChild(li);
+        }
+      };
+
+      const renderSlo = () => {
+        if (!state.slo) {
+          sloPanel.textContent = "No runs yet.";
+          return;
+        }
+        sloPanel.textContent =
+          "total runs: " + state.slo.totalRuns + "\\n" +
+          "pass rate: " + state.slo.passRate + "%\\n" +
+          "pass rate 24h: " + state.slo.passRate24h + "%\\n" +
+          "avg duration: " + state.slo.averageDurationMs + "ms\\n" +
+          "last run: " + (state.slo.lastRunAt || "never");
+      };
+
+      const renderHeader = () => {
+        loopChip.textContent = "loop: " + state.loop;
+        toggleLoopBtn.textContent = state.loop === "running" ? "Pause" : "Start";
+        toggleDemoFailureBtn.textContent = state.demoFailureMode ? "Fix demo endpoint" : "Break demo endpoint";
+        authState.textContent = "auth: " + (state.authEnabled ? "enabled" : "disabled");
+      };
+
       const refresh = async () => {
-        const pair = await Promise.all([
-          request("/gates"),
+        const [statusBody, gatesBody, runsBody, sloBody, templateBody, configBody, authBody, logsBody] = await Promise.all([
           request("/status"),
+          request("/gates"),
+          request("/runs?limit=12"),
+          request("/slo"),
+          request("/templates"),
+          request("/config"),
+          request("/auth/status"),
+          request("/logs?limit=35"),
         ]);
-        state.gates = pair[0].result.gates;
-        state.loop = pair[1].result.loop.status;
+
+        state.loop = statusBody.result.loop.status;
+        state.gates = gatesBody.result.gates;
+        state.runs = runsBody.result.runs;
+        state.slo = sloBody.result.slo;
+        state.templates = templateBody.result.templates;
+        state.demoFailureMode = Boolean(configBody.result.config.demoFailureMode);
+        state.authEnabled = Boolean(authBody.result.authEnabled);
+
+        renderHeader();
         renderGates();
-        renderLoop();
+        renderRuns();
+        renderTemplates();
+        renderSlo();
+
+        const existing = logsBody.result.logs || [];
+        if (!logPanel.textContent) {
+          for (const log of existing.reverse()) {
+            addLog(log.type + ": " + log.message);
+          }
+        }
       };
 
       gateForm.addEventListener("submit", async (event) => {
         event.preventDefault();
         const assertion = gateInput.value.trim();
         if (!assertion) return;
-        gateForm.querySelector("button").disabled = true;
         try {
           await request("/gates", {
             method: "POST",
-            headers: { "content-type": "application/json" },
+            headers: authHeaders("application/json"),
             body: JSON.stringify({ assertion }),
           });
           gateInput.value = "";
           await refresh();
         } catch (err) {
           addLog("gate add failed: " + String(err));
-        } finally {
-          gateForm.querySelector("button").disabled = false;
         }
       });
 
@@ -651,44 +1316,94 @@ export class GreenlightDO extends DurableObject<Env> {
         event.preventDefault();
         const text = nudgeInput.value.trim();
         if (!text) return;
-        nudgeForm.querySelector("button").disabled = true;
         try {
           await request("/nudge", {
             method: "POST",
-            headers: { "content-type": "application/json" },
+            headers: authHeaders("application/json"),
             body: JSON.stringify({ text }),
           });
           nudgeInput.value = "";
         } catch (err) {
           addLog("nudge failed: " + String(err));
-        } finally {
-          nudgeForm.querySelector("button").disabled = false;
         }
+      });
+
+      apiKeyForm.addEventListener("submit", (event) => {
+        event.preventDefault();
+        state.apiKey = apiKeyInput.value.trim();
+        localStorage.setItem("greenlight_api_key", state.apiKey);
+        addLog("api key saved in browser storage");
       });
 
       toggleLoopBtn.addEventListener("click", async () => {
-        toggleLoopBtn.disabled = true;
         try {
-          const command = state.loop === "running" ? "/pause" : "/start";
-          await request(command, { method: "POST" });
+          await request(state.loop === "running" ? "/pause" : "/start", {
+            method: "POST",
+            headers: authHeaders(),
+          });
           await refresh();
         } catch (err) {
           addLog("loop toggle failed: " + String(err));
-        } finally {
-          toggleLoopBtn.disabled = false;
         }
       });
 
-      const streamProtocol = location.protocol === "https:" ? "wss:" : "ws:";
-      const streamURL = streamProtocol + "//" + location.host + "/stream";
-      const socket = new WebSocket(streamURL);
+      runNowBtn.addEventListener("click", async () => {
+        try {
+          await request("/run", { method: "POST", headers: authHeaders() });
+          await refresh();
+        } catch (err) {
+          addLog("run now failed: " + String(err));
+        }
+      });
+
+      bootstrapDemoBtn.addEventListener("click", async () => {
+        try {
+          await request("/demo/bootstrap", {
+            method: "POST",
+            headers: authHeaders(),
+          });
+          await refresh();
+        } catch (err) {
+          addLog("bootstrap failed: " + String(err));
+        }
+      });
+
+      toggleDemoFailureBtn.addEventListener("click", async () => {
+        try {
+          await request("/demo/failure", {
+            method: "POST",
+            headers: authHeaders("application/json"),
+            body: JSON.stringify({ enabled: !state.demoFailureMode }),
+          });
+          await refresh();
+        } catch (err) {
+          addLog("toggle demo failure failed: " + String(err));
+        }
+      });
+
+      proofBtn.addEventListener("click", async () => {
+        try {
+          const proof = await request("/proof");
+          const blob = new Blob([JSON.stringify(proof.result, null, 2)], { type: "application/json" });
+          const link = document.createElement("a");
+          link.href = URL.createObjectURL(blob);
+          link.download = "greenlight-proof-" + state.project + ".json";
+          link.click();
+          URL.revokeObjectURL(link.href);
+          addLog("proof bundle downloaded");
+        } catch (err) {
+          addLog("proof download failed: " + String(err));
+        }
+      });
+
+      const protocol = location.protocol === "https:" ? "wss:" : "ws:";
+      const streamUrl = protocol + "//" + location.host + scopedPath("/stream");
+      const socket = new WebSocket(streamUrl);
       socket.addEventListener("open", () => {
-        streamState.textContent = "connected";
-        addLog("stream connected");
+        streamState.textContent = "stream: connected";
       });
       socket.addEventListener("close", () => {
-        streamState.textContent = "closed";
-        addLog("stream closed");
+        streamState.textContent = "stream: closed";
       });
       socket.addEventListener("message", (event) => {
         try {

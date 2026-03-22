@@ -20,7 +20,8 @@
     "test": "vitest run",
     "test:watch": "vitest",
     "check": "npm run typecheck && npm run lint",
-    "build": "tsc"
+    "build": "tsc",
+    "proof": "node scripts/proof-bundle.mjs"
   },
   "keywords": [
     "cloudflare",
