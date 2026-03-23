@@ -315,13 +315,15 @@ export default async (endpoint) => {
       expect((proofBody.result?.recentRuns.length ?? 0) > 0).toBe(true);
     });
 
-    it("applies deterministic self-build fix and publishes after green", async () => {
+    it("applies deterministic self-build fix and turns off demo failure mode", async () => {
       const project = `self-build-${Date.now()}`;
 
-      const bootstrap = await SELF.fetch(`http://localhost/demo/bootstrap?project=${project}`, {
+      const addGate = await SELF.fetch(`http://localhost/gates?project=${project}`, {
         method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ assertion: "GET /demo/health returns 200" }),
       });
-      expect(bootstrap.status).toBe(200);
+      expect(addGate.status).toBe(200);
 
       const breakDemo = await SELF.fetch(`http://localhost/demo/failure?project=${project}`, {
         method: "POST",
@@ -336,18 +338,42 @@ export default async (endpoint) => {
       expect(run.status).toBe(200);
       const runBody = (await run.json()) as Envelope<{
         selfBuild: { applied: boolean; action?: string };
-        published?: string;
       }>;
       expect(runBody.result?.selfBuild.applied).toBe(true);
+
+      const config = await SELF.fetch(`http://localhost/config?project=${project}`);
+      const configBody = (await config.json()) as Envelope<{ config: { demoFailureMode: boolean } }>;
+      expect(configBody.result?.config.demoFailureMode).toBe(false);
+    });
+
+    it("publishes URL when all gates are green", async () => {
+      const project = `publish-${Date.now()}`;
+      const fn = `
+export default async () => {
+  const res = await fetch("data:application/json,%7B%22ok%22%3Atrue%7D");
+  if (res.status !== 200) throw new Error("bad");
+}
+      `.trim();
+
+      const add = await SELF.fetch(`http://localhost/gates?project=${project}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ name: "publish-fn", fn }),
+      });
+      expect(add.status).toBe(200);
+
+      const run = await SELF.fetch(`http://localhost/run?project=${project}`, { method: "POST" });
+      expect(run.status).toBe(200);
+      const runBody = (await run.json()) as Envelope<{ published?: string }>;
       expect(runBody.result?.published).toBeTruthy();
 
       const status = await SELF.fetch(`http://localhost/status?project=${project}`);
       const statusBody = (await status.json()) as Envelope<{ published?: string }>;
       expect(statusBody.result?.published).toBeTruthy();
 
-      const config = await SELF.fetch(`http://localhost/config?project=${project}`);
-      const configBody = (await config.json()) as Envelope<{ config: { demoFailureMode: boolean } }>;
-      expect(configBody.result?.config.demoFailureMode).toBe(false);
+      const proof = await SELF.fetch(`http://localhost/proof?project=${project}`);
+      const proofBody = (await proof.json()) as Envelope<{ published?: string }>;
+      expect(proofBody.result?.published).toBeTruthy();
     });
   });
 
