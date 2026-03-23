@@ -2038,8 +2038,8 @@ export class GreenlightDO extends DurableObject<Env> {
   <main>
     <section class="card">
       <div class="eyebrow">greenlight</div>
-      <h1>Production API tests, with fast pass/fail answers.</h1>
-      <p class="lead">Yes, this is a test runner for your live endpoint. Add tests in plain text, run them, and see what broke.</p>
+      <h1>Set the rules. Let agents work. Verify they didn't break anything.</h1>
+      <p class="lead">Define what "correct" looks like in plain language. Greenlight watches your endpoints and gives you proof -- pass, fail, and why.</p>
       <div class="statusRow">
         <span id="projectLabel" class="chip">project: default</span>
         <span id="passRateChip" class="chip">pass 24h: 0%</span>
@@ -2051,22 +2051,22 @@ export class GreenlightDO extends DurableObject<Env> {
         <button id="proofBtn" type="button">Download proof JSON</button>
       </div>
       <ul class="heroPoints">
-        <li>Catch bad deploys before users report them.</li>
-        <li>See exactly which test failed and why.</li>
-        <li>Export proof JSON for your team or customers.</li>
+        <li>Write rules, not test suites. Plain language checks, no setup tax.</li>
+        <li>Walk away from the keyboard. Start the loop and come back to green or red.</li>
+        <li>Get receipts, not dashboards. Export proof JSON with pass, fail, and when.</li>
       </ul>
     </section>
 
     <section class="stage">
       <div class="stack">
         <section class="card">
-          <h2>Step 1: Add tests</h2>
-          <p class="muted">Write a test in plain text. Example: <span class="chip">GET /demo/health returns 200</span></p>
+          <h2>Step 1: Define rules</h2>
+          <p class="muted">Write a rule in plain language. Example: <span class="chip">GET /demo/health returns 200</span></p>
           <form id="gateForm">
-            <input id="gateInput" placeholder="Example: GET /users returns 200" />
-            <button type="submit">Add test</button>
+            <input id="gateInput" placeholder="Example: GET /api/health returns 200" />
+            <button type="submit">Add rule</button>
           </form>
-          <h3>Optional: add a hint</h3>
+          <h3>Optional: give context</h3>
           <form id="nudgeForm">
             <input id="nudgeInput" placeholder="Example: auth token needs write scope" />
             <button type="submit">Send hint</button>
@@ -2074,25 +2074,25 @@ export class GreenlightDO extends DurableObject<Env> {
           <div class="split">
             <section class="card" style="padding:14px;">
               <div class="row">
-                <strong>Your tests</strong>
-                <span id="gateCount" class="chip">tests: 0</span>
+                <strong>Your rules</strong>
+                <span id="gateCount" class="chip">rules: 0</span>
               </div>
               <ul id="gatesList" class="gates"></ul>
             </section>
             <section class="card" style="padding:14px;">
-              <strong>Starter tests</strong>
+              <strong>Example rules</strong>
               <ul id="templateList" class="templates"></ul>
             </section>
           </div>
         </section>
 
         <section class="card">
-          <h2>Step 2: Run tests</h2>
-          <p class="muted">Run once with <strong>Run now</strong>. Keep testing on a loop with <strong>Start</strong>.</p>
+          <h2>Step 2: Run checks</h2>
+          <p class="muted">Run once with <strong>Run now</strong>. Keep verifying on a loop with <strong>Start</strong>.</p>
           <div class="controls">
             <button id="toggleLoopBtn" type="button">Start</button>
             <button id="runNowBtn" type="button">Run now</button>
-            <button id="bootstrapDemoBtn" type="button">Load demo tests</button>
+            <button id="bootstrapDemoBtn" type="button">Load demo rules</button>
             <button id="toggleDemoFailureBtn" type="button">Break demo endpoint</button>
           </div>
           <form id="apiKeyForm">
@@ -2105,7 +2105,7 @@ export class GreenlightDO extends DurableObject<Env> {
 
       <div class="stack">
         <section class="card">
-          <h2>Step 3: See test results</h2>
+          <h2>Step 3: Verify results</h2>
           <section class="card" style="padding:14px;">
             <div class="row">
               <strong>Recent runs</strong>
@@ -2117,13 +2117,18 @@ export class GreenlightDO extends DurableObject<Env> {
             <strong>Reliability summary</strong>
             <div id="sloPanel" class="mono"></div>
           </section>
+          <section class="card" style="padding:14px;">
+            <strong>Proof JSON preview</strong>
+            <p class="muted">This is the kind of artifact you can export and share.</p>
+            <pre id="proofPreview" class="mono"></pre>
+          </section>
         </section>
       </div>
     </section>
 
     <section class="card">
       <h2>Live event log</h2>
-      <p class="muted">Live feed of what the app is doing right now.</p>
+      <p class="muted">Live feed of rule checks, failures, recoveries, and proof events.</p>
       <pre id="logPanel" class="mono"></pre>
     </section>
   </main>
@@ -2163,6 +2168,7 @@ export class GreenlightDO extends DurableObject<Env> {
       const runList = $("runList");
       const runCount = $("runCount");
       const sloPanel = $("sloPanel");
+      const proofPreview = $("proofPreview");
       const logPanel = $("logPanel");
       const streamState = $("streamState");
       const projectLabel = $("projectLabel");
@@ -2228,7 +2234,7 @@ export class GreenlightDO extends DurableObject<Env> {
 
       const renderGates = () => {
         gatesList.innerHTML = "";
-        gateCount.textContent = "tests: " + state.gates.length;
+        gateCount.textContent = "rules: " + state.gates.length;
         for (const gate of state.gates) {
           const li = document.createElement("li");
           li.className = "item";
@@ -2291,6 +2297,18 @@ export class GreenlightDO extends DurableObject<Env> {
           "last run: " + (state.slo.lastRunAt || "never");
       };
 
+      const renderProofPreview = () => {
+        const failing = state.runs.filter(run => !run.pass).map(run => run.gate);
+        const preview = {
+          project: state.project,
+          pass_rate_24h: (state.slo ? state.slo.passRate24h : 0) + "%",
+          checks: state.gates.length,
+          last_run: state.slo?.lastRunAt || "never",
+          failures: failing,
+        };
+        proofPreview.textContent = JSON.stringify(preview, null, 2);
+      };
+
       const renderHeader = () => {
         passRateChip.textContent = "pass 24h: " + (state.slo ? state.slo.passRate24h : 0) + "%";
         proofFreshnessChip.textContent = "proof: " + relativeAge(state.lastProofAt);
@@ -2324,6 +2342,7 @@ export class GreenlightDO extends DurableObject<Env> {
         renderRuns();
         renderTemplates();
         renderSlo();
+        renderProofPreview();
 
         const existing = logsBody.result.logs || [];
         if (!logPanel.textContent) {
