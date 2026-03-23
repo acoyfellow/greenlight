@@ -1935,71 +1935,135 @@ export class GreenlightDO extends DurableObject<Env> {
   <style>
     :root { color-scheme: dark; }
     * { box-sizing: border-box; font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; }
-    body { margin: 0; background: #0b1020; color: #dbe4ff; }
-    main { max-width: 1200px; margin: 0 auto; padding: 24px; display: grid; gap: 14px; }
-    .card { background: #111a33; border: 1px solid #28345f; border-radius: 12px; padding: 14px; }
-    .header { display: grid; gap: 8px; }
-    h1 { margin: 0; font-size: 28px; }
-    p { margin: 0; color: #aab6df; }
-    .muted { color: #8ea0d8; font-size: 12px; }
-    .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
-    @media (max-width: 980px) { .grid { grid-template-columns: 1fr; } }
-    .row { display: flex; align-items: center; justify-content: space-between; gap: 8px; flex-wrap: wrap; }
+    body { margin: 0; background: #080d1c; color: #e6eeff; line-height: 1.45; }
+    main { max-width: 1080px; margin: 0 auto; padding: 30px 20px 40px; display: grid; gap: 18px; }
+    .card { background: #0f1730; border: 1px solid #263864; border-radius: 14px; padding: 20px; display: grid; gap: 12px; }
+    h1 { margin: 0; font-size: 34px; line-height: 1.15; }
+    h2 { margin: 0; font-size: 20px; line-height: 1.25; }
+    p { margin: 0; color: #b3c2eb; }
+    .eyebrow { color: #9ab0e6; font-size: 12px; letter-spacing: 0.08em; text-transform: uppercase; }
+    .lead { color: #cedafd; max-width: 760px; font-size: 16px; }
+    .muted { color: #94a9dc; font-size: 13px; }
+    .statusRow { display: flex; flex-wrap: wrap; gap: 8px; }
+    .chip { border: 1px solid #36508a; border-radius: 999px; padding: 5px 10px; font-size: 12px; background: #0b132a; }
+    .actionRow { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 4px; }
+    .progress { margin: 0; padding-left: 18px; color: #b7c9f6; display: grid; gap: 4px; }
+    .row { display: flex; align-items: center; justify-content: space-between; gap: 10px; flex-wrap: wrap; }
     .controls { display: flex; gap: 8px; flex-wrap: wrap; }
-    form { display: flex; gap: 8px; margin-top: 8px; }
-    input, select { flex: 1; min-width: 0; border-radius: 8px; border: 1px solid #34467a; background: #0b1431; color: #eef3ff; padding: 10px; }
-    button { border: 1px solid #3e5190; background: #1b2a59; color: #eef3ff; border-radius: 8px; padding: 10px 12px; cursor: pointer; font-weight: 600; }
-    button:hover { background: #253977; }
+    .split { display: grid; gap: 14px; grid-template-columns: 1fr 1fr; align-items: start; }
+    @media (max-width: 900px) { .split { grid-template-columns: 1fr; } }
+    form { display: flex; gap: 8px; flex-wrap: wrap; }
+    input, select {
+      flex: 1;
+      min-width: 220px;
+      border-radius: 10px;
+      border: 1px solid #365089;
+      background: #0a1430;
+      color: #eef3ff;
+      padding: 11px 12px;
+    }
+    button {
+      border: 1px solid #4868b2;
+      background: #1a316a;
+      color: #eef3ff;
+      border-radius: 10px;
+      padding: 10px 13px;
+      cursor: pointer;
+      font-weight: 600;
+      line-height: 1.2;
+    }
+    button:hover { background: #234187; }
     button:disabled { opacity: 0.6; cursor: wait; }
-    .gates, .runs, .templates { list-style: none; margin: 8px 0 0; padding: 0; display: grid; gap: 6px; }
-    .item { border: 1px solid #263359; border-radius: 8px; padding: 8px; background: #0d1838; display: flex; gap: 8px; align-items: center; }
+    .gates, .runs, .templates { list-style: none; margin: 0; padding: 0; display: grid; gap: 8px; }
+    .item {
+      border: 1px solid #2a3d6a;
+      border-radius: 10px;
+      padding: 10px;
+      background: #0c1735;
+      display: flex;
+      gap: 10px;
+      align-items: center;
+    }
+    .item button { margin-left: auto; }
     .dot { width: 10px; height: 10px; border-radius: 999px; flex: 0 0 10px; }
-    .dot.red { background: #ef4444; }
-    .dot.green { background: #22c55e; }
+    .dot.red { background: #f87171; }
+    .dot.green { background: #4ade80; }
     .dot.stuck { background: #f59e0b; }
-    .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; font-size: 12px; white-space: pre-wrap; margin: 0; max-height: 240px; overflow: auto; }
-    .chip { border: 1px solid #32467d; border-radius: 999px; padding: 4px 8px; font-size: 12px; }
-    .ok { color: #86efac; }
-    .bad { color: #fda4af; }
+    .mono {
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+      font-size: 12px;
+      white-space: pre-wrap;
+      margin: 0;
+      max-height: 270px;
+      overflow: auto;
+      border: 1px solid #2a3d6a;
+      border-radius: 10px;
+      background: #0a1430;
+      padding: 10px;
+    }
   </style>
 </head>
 <body>
   <main>
-    <section class="card header">
-      <h1>Contract-test any live endpoint in 60 seconds.</h1>
-      <p>Define gates, watch regressions go red, recover to green, export proof.</p>
-      <div class="row">
-        <div class="controls">
-          <span id="projectLabel" class="chip">project: default</span>
-          <span id="passRateChip" class="chip">pass 24h: 0%</span>
-          <span id="proofFreshnessChip" class="chip">proof: never</span>
-          <span id="streamState" class="chip">stream: connecting</span>
-        </div>
-        <div class="controls">
-          <button id="demoCtaBtn" type="button">Run 60-second demo</button>
-          <button id="proofBtn" type="button">See proof JSON</button>
-        </div>
+    <section class="card">
+      <div class="eyebrow">greenlight</div>
+      <h1>Check your API. See red to green. Share proof.</h1>
+      <p class="lead">This page is a guided flow: add checks, run checks, then review what passed and failed.</p>
+      <div class="statusRow">
+        <span id="projectLabel" class="chip">project: default</span>
+        <span id="passRateChip" class="chip">pass 24h: 0%</span>
+        <span id="proofFreshnessChip" class="chip">proof: never</span>
+        <span id="streamState" class="chip">stream: connecting</span>
       </div>
-      <div class="muted">1) Bootstrap demo gates 2) Break endpoint 3) Recover + proof.</div>
+      <div class="actionRow">
+        <button id="demoCtaBtn" type="button">Run guided demo</button>
+        <button id="proofBtn" type="button">Download proof JSON</button>
+      </div>
+      <ol class="progress">
+        <li>Add one or more checks.</li>
+        <li>Run now or start the loop.</li>
+        <li>Watch failures turn green and export proof.</li>
+      </ol>
     </section>
 
     <section class="card">
+      <h2>Step 1: Add checks and hints</h2>
+      <p class="muted">Write checks in plain language, for example: <span class="chip">GET /demo/health returns 200</span></p>
       <form id="gateForm">
-        <input id="gateInput" placeholder="GET /demo/health returns 200" required />
-        <button type="submit">Add gate</button>
+        <input id="gateInput" placeholder="Add a check..." required />
+        <button type="submit">Add check</button>
       </form>
       <form id="nudgeForm">
-        <input id="nudgeInput" placeholder="Use deterministic response schema" required />
-        <button type="submit">Send nudge</button>
+        <input id="nudgeInput" placeholder="Add a short hint (optional)..." required />
+        <button type="submit">Send hint</button>
       </form>
-      <div class="row" style="margin-top:8px;">
+      <div class="split">
+        <section class="card" style="padding:14px;">
+          <div class="row">
+            <strong>Current checks</strong>
+            <span id="gateCount" class="chip">gates: 0</span>
+          </div>
+          <ul id="gatesList" class="gates"></ul>
+        </section>
+        <section class="card" style="padding:14px;">
+          <div class="row">
+            <strong>Quick templates</strong>
+          </div>
+          <ul id="templateList" class="templates"></ul>
+        </section>
+      </div>
+    </section>
+
+    <section class="card">
+      <h2>Step 2: Run and control</h2>
+      <p class="muted">Use Run now for a single pass. Use Start for ongoing checks.</p>
+      <div class="row">
         <div class="controls">
           <button id="toggleLoopBtn" type="button">Start</button>
           <button id="runNowBtn" type="button">Run now</button>
           <button id="bootstrapDemoBtn" type="button">Bootstrap demo gates</button>
           <button id="toggleDemoFailureBtn" type="button">Break demo endpoint</button>
         </div>
-        <span id="gateCount" class="muted">gates: 0</span>
       </div>
       <form id="apiKeyForm">
         <input id="apiKeyInput" placeholder="Optional API key (x-api-key)" />
@@ -2008,41 +2072,26 @@ export class GreenlightDO extends DurableObject<Env> {
       <div class="muted" id="authState">auth: unknown</div>
     </section>
 
-    <section class="grid">
-      <section class="card">
-        <div class="row">
-          <strong>Gates</strong>
-        </div>
-        <ul id="gatesList" class="gates"></ul>
-      </section>
-      <section class="card">
-        <div class="row">
-          <strong>Templates</strong>
-        </div>
-        <ul id="templateList" class="templates"></ul>
-      </section>
-    </section>
-
-    <section class="grid">
-      <section class="card">
+    <section class="card">
+      <h2>Step 3: Review results</h2>
+      <div class="split">
+        <section class="card" style="padding:14px;">
         <div class="row">
           <strong>Recent runs</strong>
-          <span id="runCount" class="muted">0</span>
+          <span id="runCount" class="chip">0</span>
         </div>
         <ul id="runList" class="runs"></ul>
-      </section>
-      <section class="card">
-        <div class="row">
-          <strong>SLO dashboard</strong>
-        </div>
+        </section>
+        <section class="card" style="padding:14px;">
+        <strong>Reliability summary</strong>
         <div id="sloPanel" class="mono"></div>
-      </section>
+        </section>
+      </div>
     </section>
 
     <section class="card">
-      <div class="row">
-        <strong>Live log stream</strong>
-      </div>
+      <h2>Live event log</h2>
+      <p class="muted">Shows loop events, gate changes, and auth actions in real time.</p>
       <pre id="logPanel" class="mono"></pre>
     </section>
   </main>
