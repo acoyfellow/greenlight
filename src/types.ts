@@ -46,6 +46,10 @@ export interface Config {
   maxIterations: number;
   loopInterval: number;
   autoPublish: boolean;
+  targetEndpoint: string;
+  rateLimitPerMinute: number;
+  alertWebhookUrl: string;
+  demoFailureMode: boolean;
 }
 
 export const DEFAULT_CONFIG: Config = {
@@ -53,6 +57,10 @@ export const DEFAULT_CONFIG: Config = {
   maxIterations: 20,
   loopInterval: 30,
   autoPublish: true,
+  targetEndpoint: "",
+  rateLimitPerMinute: 120,
+  alertWebhookUrl: "",
+  demoFailureMode: false,
 };
 
 /** Overall loop state */

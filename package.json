@@ -5,6 +5,9 @@
   "type": "module",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
+  "bin": {
+    "greenlight": "./bin/greenlight.mjs"
+  },
   "exports": {
     ".": {
       "types": "./dist/index.d.ts",
@@ -12,7 +15,8 @@
     }
   },
   "files": [
-    "dist"
+    "dist",
+    "bin"
   ],
   "scripts": {
     "typecheck": "tsc --noEmit",
@@ -20,7 +24,8 @@
     "test": "vitest run",
     "test:watch": "vitest",
     "check": "npm run typecheck && npm run lint",
-    "build": "tsc"
+    "build": "tsc",
+    "proof": "node scripts/proof-bundle.mjs"
   },
   "keywords": [
     "cloudflare",
@@ -40,5 +45,9 @@
     "oxlint": "^1.56.0",
     "typescript": "^5.8.0",
     "vitest": "^4.1.0"
+  },
+  "dependencies": {
+    "hono": "^4.12.8",
+    "jose": "^6.2.2"
   }
 }
