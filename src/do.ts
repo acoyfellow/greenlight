@@ -987,7 +987,7 @@ export class GreenlightDO extends DurableObject<Env> {
         const args = this.splitTopLevel(fetchStmt[2]!, ",");
         const url = String(this.evaluateFnExpression(args[0]!, values, endpoint));
         let method = "GET";
-        let redirect: RequestRedirect | undefined;
+        let redirect: "follow" | "manual" | "error" | undefined;
         let headers: Record<string, string> | undefined;
         let bodyValue: string | undefined;
 
@@ -999,7 +999,7 @@ export class GreenlightDO extends DurableObject<Env> {
           }
           const redirectMatch = options.match(/redirect\s*:\s*["'](follow|manual|error)["']/i);
           if (redirectMatch) {
-            redirect = redirectMatch[1]!.toLowerCase() as RequestRedirect;
+            redirect = redirectMatch[1]!.toLowerCase() as "follow" | "manual" | "error";
           }
           const headerMatch = options.match(/headers\s*:\s*\{([\s\S]*?)\}/);
           if (headerMatch) {
