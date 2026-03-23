@@ -998,7 +998,7 @@ export class GreenlightDO extends DurableObject<Env> {
         continue;
       }
       const assertion = gate.assertion.toLowerCase();
-      if (cfg.demoFailureMode && assertion.includes("/demo/health") && failure.error?.includes("Expected status 200")) {
+      if (cfg.demoFailureMode && assertion.includes("/demo/health")) {
         this.setConfig("demoFailureMode", false);
         this.broadcastLog("fix_attempt", "Applied deterministic self-build fix", {
           action: "set demoFailureMode=false",
