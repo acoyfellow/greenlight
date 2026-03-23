@@ -63,6 +63,38 @@ describe("HTTP API", () => {
       expect(body.result?.name).toBe("custom-check");
     });
 
+    it("executes a custom function gate during run", async () => {
+      const project = `fn-${Date.now()}`;
+      const fn = `
+export default async (endpoint) => {
+  const health = await fetch(\`\${endpoint}/demo/health\`);
+  if (health.status !== 200) throw new Error("health failed");
+  const price = await fetch(\`\${endpoint}/demo/price\`);
+  if (price.status !== 200) throw new Error("price failed");
+  const body = await price.json();
+  if (body.currency !== "USD") throw new Error("currency failed");
+}
+      `.trim();
+
+      const add = await SELF.fetch(`http://localhost/gates?project=${project}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ name: "fn-gate", fn }),
+      });
+      expect(add.status).toBe(200);
+
+      const run = await SELF.fetch(`http://localhost/run?project=${project}`, { method: "POST" });
+      expect(run.status).toBe(200);
+
+      const runs = await SELF.fetch(`http://localhost/runs?project=${project}&limit=5`);
+      const runsBody = (await runs.json()) as Envelope<{
+        runs: Array<{ gate: string; pass: boolean; error?: string }>;
+      }>;
+      const match = runsBody.result?.runs.find(r => r.gate === "fn-gate");
+      expect(match?.pass).toBe(true);
+      expect(match?.error).toBeUndefined();
+    });
+
     it("rejects missing assertion and fn", async () => {
       const res = await SELF.fetch("http://localhost/gates", {
         method: "POST",

@@ -955,9 +955,246 @@ export class GreenlightDO extends DurableObject<Env> {
 
   private async executeGate(gate: Gate, endpoint: string): Promise<void> {
     if (gate.fn) {
-      throw new Error("Custom function gates are not supported in runtime mode");
+      await this.executeFunctionGate(gate.fn, endpoint);
+      return;
     }
     await this.executeAssertionGate(gate.assertion, endpoint);
+  }
+
+  private async executeFunctionGate(fnSource: string, endpoint: string): Promise<void> {
+    const normalized = fnSource
+      .replace(/\r/g, "")
+      .replace(/\s+/g, " ")
+      .trim();
+    const bodyMatch = normalized.match(/export\s+default\s+async\s*\([^)]*\)\s*=>\s*\{([\s\S]*)\}$/);
+    if (!bodyMatch) {
+      throw new Error("Unsupported function gate: expected `export default async (...) => { ... }`");
+    }
+
+    const body = bodyMatch[1]!.trim();
+    const statements = body.split(";").map(s => s.trim()).filter(Boolean);
+    const values = new Map<string, unknown>();
+    const responses = new Map<string, Response>();
+
+    for (const statement of statements) {
+      if (statement === "return" || statement === "return undefined" || statement.startsWith("//")) {
+        continue;
+      }
+
+      const fetchStmt = statement.match(/^const\s+([A-Za-z_]\w*)\s*=\s*await\s+fetch\(([\s\S]+)\)$/);
+      if (fetchStmt) {
+        const varName = fetchStmt[1]!;
+        const args = this.splitTopLevel(fetchStmt[2]!, ",");
+        const url = String(this.evaluateFnExpression(args[0]!, values, endpoint));
+        let method = "GET";
+        let redirect: RequestRedirect | undefined;
+        let headers: Record<string, string> | undefined;
+        let bodyValue: string | undefined;
+
+        if (args[1]) {
+          const options = args[1]!;
+          const methodMatch = options.match(/method\s*:\s*["'](GET|POST|PUT|DELETE|PATCH)["']/i);
+          if (methodMatch) {
+            method = methodMatch[1]!.toUpperCase();
+          }
+          const redirectMatch = options.match(/redirect\s*:\s*["'](follow|manual|error)["']/i);
+          if (redirectMatch) {
+            redirect = redirectMatch[1]!.toLowerCase() as RequestRedirect;
+          }
+          const headerMatch = options.match(/headers\s*:\s*\{([\s\S]*?)\}/);
+          if (headerMatch) {
+            const raw = headerMatch[1]!;
+            headers = {};
+            const pairs = this.splitTopLevel(raw, ",");
+            for (const pair of pairs) {
+              const kv = pair.match(/["']?([^"':]+)["']?\s*:\s*["']([^"']+)["']/);
+              if (kv) {
+                headers[kv[1]!.trim()] = kv[2]!;
+              }
+            }
+          }
+          const bodyMatch = options.match(/body\s*:\s*JSON\.stringify\((\{[\s\S]*\})\)/);
+          if (bodyMatch) {
+            const obj = this.parseJsObjectLiteral(bodyMatch[1]!);
+            bodyValue = JSON.stringify(obj);
+          }
+        }
+
+        const response = await fetch(url, {
+          method,
+          redirect,
+          headers,
+          body: bodyValue,
+        });
+        responses.set(varName, response);
+        continue;
+      }
+
+      const statusCheck = statement.match(/^if\s*\(\s*([A-Za-z_]\w*)\.status\s*!==\s*(\d+)\s*\)\s*throw\s+new\s+Error\([\s\S]*\)$/);
+      if (statusCheck) {
+        const response = responses.get(statusCheck[1]!);
+        if (!response) {
+          throw new Error(`Unknown response variable: ${statusCheck[1]}`);
+        }
+        const expected = Number(statusCheck[2]!);
+        if (response.status !== expected) {
+          throw new Error(`Expected ${statusCheck[1]}.status ${expected}, got ${response.status}`);
+        }
+        continue;
+      }
+
+      const jsonDestructure = statement.match(/^const\s+\{\s*([A-Za-z_]\w*)\s*\}\s*=\s*await\s+([A-Za-z_]\w*)\.json\(\)\s*$/);
+      if (jsonDestructure) {
+        const field = jsonDestructure[1]!;
+        const responseVar = jsonDestructure[2]!;
+        const response = responses.get(responseVar);
+        if (!response) {
+          throw new Error(`Unknown response variable: ${responseVar}`);
+        }
+        const payload = await response.clone().json() as Record<string, unknown>;
+        values.set(field, payload[field]);
+        continue;
+      }
+
+      const jsonAssign = statement.match(/^const\s+([A-Za-z_]\w*)\s*=\s*await\s+([A-Za-z_]\w*)\.json\(\)\s*$/);
+      if (jsonAssign) {
+        const targetVar = jsonAssign[1]!;
+        const responseVar = jsonAssign[2]!;
+        const response = responses.get(responseVar);
+        if (!response) {
+          throw new Error(`Unknown response variable: ${responseVar}`);
+        }
+        values.set(targetVar, await response.clone().json());
+        continue;
+      }
+
+      const neqFieldCheck = statement.match(
+        /^if\s*\(\s*([A-Za-z_]\w*)\.([A-Za-z_]\w*)\s*!==\s*([\s\S]+)\)\s*throw\s+new\s+Error\([\s\S]*\)$/
+      );
+      if (neqFieldCheck) {
+        const objectVar = neqFieldCheck[1]!;
+        const field = neqFieldCheck[2]!;
+        const expectedExpr = neqFieldCheck[3]!;
+        const objectValue = values.get(objectVar) as Record<string, unknown> | undefined;
+        if (!objectValue || typeof objectValue !== "object") {
+          throw new Error(`Unknown object variable: ${objectVar}`);
+        }
+        const expected = this.evaluateFnExpression(expectedExpr, values, endpoint);
+        if (objectValue[field] !== expected) {
+          throw new Error(`Expected ${objectVar}.${field} to equal ${String(expected)}, got ${String(objectValue[field])}`);
+        }
+        continue;
+      }
+
+      const neqVarCheck = statement.match(/^if\s*\(\s*([A-Za-z_]\w*)\s*!==\s*([\s\S]+)\)\s*throw\s+new\s+Error\([\s\S]*\)$/);
+      if (neqVarCheck) {
+        const varName = neqVarCheck[1]!;
+        const expected = this.evaluateFnExpression(neqVarCheck[2]!, values, endpoint);
+        if (values.get(varName) !== expected) {
+          throw new Error(`Expected ${varName} to equal ${String(expected)}, got ${String(values.get(varName))}`);
+        }
+        continue;
+      }
+
+      throw new Error(`Unsupported function gate syntax: ${statement}`);
+    }
+  }
+
+  private splitTopLevel(text: string, separator: string): string[] {
+    const out: string[] = [];
+    let current = "";
+    let depthParen = 0;
+    let depthBrace = 0;
+    let depthBracket = 0;
+    let quote: "'" | "\"" | "`" | null = null;
+    let escaped = false;
+
+    for (const ch of text) {
+      if (escaped) {
+        current += ch;
+        escaped = false;
+        continue;
+      }
+      if (ch === "\\") {
+        current += ch;
+        escaped = true;
+        continue;
+      }
+      if (quote) {
+        current += ch;
+        if (ch === quote) {
+          quote = null;
+        }
+        continue;
+      }
+      if (ch === "'" || ch === "\"" || ch === "`") {
+        quote = ch;
+        current += ch;
+        continue;
+      }
+      if (ch === "(") depthParen += 1;
+      if (ch === ")") depthParen -= 1;
+      if (ch === "{") depthBrace += 1;
+      if (ch === "}") depthBrace -= 1;
+      if (ch === "[") depthBracket += 1;
+      if (ch === "]") depthBracket -= 1;
+      if (ch === separator && depthParen === 0 && depthBrace === 0 && depthBracket === 0) {
+        out.push(current.trim());
+        current = "";
+        continue;
+      }
+      current += ch;
+    }
+    if (current.trim()) {
+      out.push(current.trim());
+    }
+    return out;
+  }
+
+  private evaluateFnExpression(expr: string, values: Map<string, unknown>, endpoint: string): unknown {
+    const text = expr.trim();
+    if (!text) return "";
+    if (text === "endpoint") return endpoint;
+    if (/^-?\d+(\.\d+)?$/.test(text)) return Number(text);
+    if (text === "true") return true;
+    if (text === "false") return false;
+    if (text === "null") return null;
+    if ((text.startsWith("\"") && text.endsWith("\"")) || (text.startsWith("'") && text.endsWith("'"))) {
+      return text.slice(1, -1);
+    }
+    if (text.startsWith("`") && text.endsWith("`")) {
+      const inner = text.slice(1, -1);
+      return inner.replace(/\$\{([^}]+)\}/g, (_m, name: string) => {
+        const key = name.trim();
+        if (key === "endpoint") {
+          return endpoint;
+        }
+        if (!values.has(key)) {
+          throw new Error(`Unknown interpolation variable: ${key}`);
+        }
+        return String(values.get(key));
+      });
+    }
+    if (text.includes("+")) {
+      const parts = this.splitTopLevel(text, "+");
+      return parts.map(part => String(this.evaluateFnExpression(part, values, endpoint))).join("");
+    }
+    if (values.has(text)) {
+      return values.get(text);
+    }
+    throw new Error(`Unsupported expression: ${expr}`);
+  }
+
+  private parseJsObjectLiteral(rawObject: string): Record<string, unknown> {
+    const normalized = rawObject
+      .trim()
+      .replace(/([{,]\s*)([A-Za-z_]\w*)\s*:/g, "$1\"$2\":")
+      .replace(/'/g, "\"");
+    try {
+      return JSON.parse(normalized) as Record<string, unknown>;
+    } catch {
+      throw new Error(`Invalid object literal: ${rawObject}`);
+    }
   }
 
   private async executeAssertionGate(assertion: string, endpoint: string): Promise<void> {
