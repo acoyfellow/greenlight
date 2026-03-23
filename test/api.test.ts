@@ -184,6 +184,33 @@ describe("HTTP API", () => {
     });
   });
 
+  describe("POST /destroy", () => {
+    it("resets project state", async () => {
+      const project = `destroy-${Date.now()}`;
+
+      const addGate = await SELF.fetch(`http://localhost/gates?project=${project}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ assertion: "GET /demo/health returns 200" }),
+      });
+      expect(addGate.status).toBe(200);
+
+      const destroy = await SELF.fetch(`http://localhost/destroy?project=${project}`, {
+        method: "POST",
+      });
+      expect(destroy.status).toBe(200);
+
+      const status = await SELF.fetch(`http://localhost/status?project=${project}`);
+      const body = (await status.json()) as Envelope<{
+        gates: { total: number };
+        loop: { status: string; iteration: number };
+      }>;
+      expect(body.result?.gates.total).toBe(0);
+      expect(body.result?.loop.status).toBe("idle");
+      expect(body.result?.loop.iteration).toBe(0);
+    });
+  });
+
   describe("envelope format", () => {
     it("every response has ok, command, and next_actions", async () => {
       const endpoints = [

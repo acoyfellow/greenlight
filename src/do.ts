@@ -560,6 +560,14 @@ export class GreenlightDO extends DurableObject<Env> {
       ]));
     });
 
+    app.post("/destroy", (c) => {
+      const command = c.get("command");
+      this.destroyProject();
+      return json200(envelope(command, true, { destroyed: true }, undefined, undefined, [
+        { command: "GET /status", description: "Project state is reset" },
+      ]));
+    });
+
     app.notFound((c) => {
       const command = c.get("command");
       return json200(envelope(command, false, undefined, {
@@ -883,6 +891,30 @@ export class GreenlightDO extends DurableObject<Env> {
     }
     this.sql.exec(`UPDATE loop_state SET status = 'paused'`);
     this.ctx.storage.deleteAlarm();
+  }
+
+  private destroyProject(): void {
+    this.ctx.storage.deleteAlarm();
+    this.sql.exec(`DELETE FROM gates`);
+    this.sql.exec(`DELETE FROM memories`);
+    this.sql.exec(`DELETE FROM memories_fts`);
+    this.sql.exec(`DELETE FROM nudges`);
+    this.sql.exec(`DELETE FROM config`);
+    this.sql.exec(`DELETE FROM runs`);
+    this.sql.exec(`DELETE FROM rate_limits`);
+    this.sql.exec(`DELETE FROM logs`);
+    this.sql.exec(`DELETE FROM auth_tokens`);
+    this.sql.exec(`DELETE FROM loop_state`);
+    this.sql.exec(`INSERT INTO loop_state (status, iteration) VALUES ('idle', 0)`);
+    this.jwtJwksCache.clear();
+    for (const socket of this.streamSockets) {
+      try {
+        socket.close(1000, "project destroyed");
+      } catch {
+        // Ignore socket close errors during reset.
+      }
+    }
+    this.streamSockets.clear();
   }
 
   private getTemplates(): Template[] {
