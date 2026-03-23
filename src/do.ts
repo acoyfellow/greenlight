@@ -2030,11 +2030,11 @@ export class GreenlightDO extends DurableObject<Env> {
       <h2>Step 1: Add checks and hints</h2>
       <p class="muted">Write checks in plain language, for example: <span class="chip">GET /demo/health returns 200</span></p>
       <form id="gateForm">
-        <input id="gateInput" placeholder="Add a check..." required />
+        <input id="gateInput" placeholder="Add a check..." />
         <button type="submit">Add check</button>
       </form>
       <form id="nudgeForm">
-        <input id="nudgeInput" placeholder="Add a short hint (optional)..." required />
+        <input id="nudgeInput" placeholder="Add a short hint (optional)..." />
         <button type="submit">Send hint</button>
       </form>
       <div class="split">
