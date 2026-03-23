@@ -314,6 +314,41 @@ export default async (endpoint) => {
       expect((proofBody.result?.gates.length ?? 0) > 0).toBe(true);
       expect((proofBody.result?.recentRuns.length ?? 0) > 0).toBe(true);
     });
+
+    it("applies deterministic self-build fix and publishes after green", async () => {
+      const project = `self-build-${Date.now()}`;
+
+      const bootstrap = await SELF.fetch(`http://localhost/demo/bootstrap?project=${project}`, {
+        method: "POST",
+      });
+      expect(bootstrap.status).toBe(200);
+
+      const breakDemo = await SELF.fetch(`http://localhost/demo/failure?project=${project}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ enabled: true }),
+      });
+      expect(breakDemo.status).toBe(200);
+
+      const run = await SELF.fetch(`http://localhost/run?project=${project}`, {
+        method: "POST",
+      });
+      expect(run.status).toBe(200);
+      const runBody = (await run.json()) as Envelope<{
+        selfBuild: { applied: boolean; action?: string };
+        published?: string;
+      }>;
+      expect(runBody.result?.selfBuild.applied).toBe(true);
+      expect(runBody.result?.published).toBeTruthy();
+
+      const status = await SELF.fetch(`http://localhost/status?project=${project}`);
+      const statusBody = (await status.json()) as Envelope<{ published?: string }>;
+      expect(statusBody.result?.published).toBeTruthy();
+
+      const config = await SELF.fetch(`http://localhost/config?project=${project}`);
+      const configBody = (await config.json()) as Envelope<{ config: { demoFailureMode: boolean } }>;
+      expect(configBody.result?.config.demoFailureMode).toBe(false);
+    });
   });
 
   describe("api key auth", () => {

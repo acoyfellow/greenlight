@@ -449,6 +449,7 @@ export class GreenlightDO extends DurableObject<Env> {
         generatedAt: new Date().toISOString(),
         loop: this.getLoopState(),
         gates: this.listGates(),
+        published: this.getPublishedUrl(),
         recentRuns: this.listRuns(30),
         slo: this.getSloSummary(),
         config: this.getConfig(),
@@ -463,9 +464,23 @@ export class GreenlightDO extends DurableObject<Env> {
       const origin = new URL(c.req.url).origin;
       const endpoint = this.resolveTargetEndpoint(origin);
       this.bumpIteration();
-      const results = await this.runGates(endpoint);
+      let results = await this.runGates(endpoint);
+      const selfBuild = await this.attemptSelfBuild(results, endpoint);
+      if (selfBuild.applied) {
+        results = await this.runGates(endpoint);
+      }
+      const gates = this.listGates();
+      const published = gates.length > 0 && gates.every(g => g.status === "green")
+        ? this.publishIfEligible(endpoint)
+        : this.getPublishedUrl();
       this.broadcastLog("manual_run", "Manual run completed", { endpoint, gates: results.length });
-      return json200(envelope(command, true, { endpoint, results, slo: this.getSloSummary() }));
+      return json200(envelope(command, true, {
+        endpoint,
+        results,
+        slo: this.getSloSummary(),
+        selfBuild,
+        published,
+      }));
     });
 
     app.post("/gates", async (c) => {
@@ -488,7 +503,10 @@ export class GreenlightDO extends DurableObject<Env> {
 
     app.get("/gates", (c) => {
       const command = c.get("command");
-      return json200(envelope(command, true, { gates: this.listGates() }, undefined, undefined, [
+      return json200(envelope(command, true, {
+        gates: this.listGates(),
+        published: this.getPublishedUrl(),
+      }, undefined, undefined, [
         { command: "POST /gates", description: "Add a gate" },
         { command: "POST /start", description: "Start the loop" },
       ]));
@@ -531,7 +549,11 @@ export class GreenlightDO extends DurableObject<Env> {
         green: gates.filter(g => g.status === "green").length,
         stuck: gates.filter(g => g.status === "stuck").length,
       };
-      return json200(envelope(command, true, { loop, gates: summary }, undefined, undefined, [
+      return json200(envelope(command, true, {
+        loop,
+        gates: summary,
+        published: this.getPublishedUrl(),
+      }, undefined, undefined, [
         { command: "POST /start", description: "Start the loop" },
         { command: "POST /gates", description: "Add a gate" },
       ]));
@@ -605,15 +627,20 @@ export class GreenlightDO extends DurableObject<Env> {
     try {
       this.bumpIteration();
       const endpoint = this.resolveTargetEndpoint();
-      const results = await this.runGates(endpoint);
+      let results = await this.runGates(endpoint);
+      const selfBuild = await this.attemptSelfBuild(results, endpoint);
+      if (selfBuild.applied) {
+        results = await this.runGates(endpoint);
+      }
       const gates = this.listGates();
       const hasStuck = gates.some(g => g.status === "stuck");
       const allGreen = gates.length > 0 && gates.every(g => g.status === "green");
 
       if (allGreen) {
+        const published = this.publishIfEligible(endpoint);
         this.sql.exec(`UPDATE loop_state SET status = 'done'`);
         this.ctx.storage.deleteAlarm();
-        this.broadcastLog("loop_done", "All gates green", { gates: gates.length });
+        this.broadcastLog("loop_done", "All gates green", { gates: gates.length, published });
         return;
       }
 
@@ -630,6 +657,7 @@ export class GreenlightDO extends DurableObject<Env> {
         iteration: this.getLoopState().iteration,
         passing: results.filter(r => r.pass).length,
         total: results.length,
+        selfBuildApplied: selfBuild.applied,
       });
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
@@ -951,6 +979,54 @@ export class GreenlightDO extends DurableObject<Env> {
       return origin;
     }
     throw new Error("No target endpoint configured");
+  }
+
+  private async attemptSelfBuild(
+    results: GateResult[],
+    endpoint: string
+  ): Promise<{ applied: boolean; action?: string }> {
+    const failing = results.filter(r => !r.pass);
+    if (failing.length === 0) {
+      return { applied: false };
+    }
+    const gates = this.listGates();
+    const byName = new Map(gates.map(g => [g.name, g]));
+    const cfg = this.getConfig();
+    for (const failure of failing) {
+      const gate = byName.get(failure.name);
+      if (!gate) {
+        continue;
+      }
+      const assertion = gate.assertion.toLowerCase();
+      if (cfg.demoFailureMode && assertion.includes("/demo/health") && failure.error?.includes("Expected status 200")) {
+        this.setConfig("demoFailureMode", false);
+        this.broadcastLog("fix_attempt", "Applied deterministic self-build fix", {
+          action: "set demoFailureMode=false",
+          gate: gate.name,
+          endpoint,
+        });
+        return { applied: true, action: "set demoFailureMode=false" };
+      }
+    }
+    this.broadcastLog("fix_attempt", "No deterministic self-build fix available", {
+      failingGates: failing.map(f => f.name),
+    });
+    return { applied: false };
+  }
+
+  private publishIfEligible(endpoint: string): string | undefined {
+    if (!this.getConfig().autoPublish) {
+      return undefined;
+    }
+    const published = endpoint.replace(/\/+$/, "");
+    this.setConfigValue("publishedUrl", published);
+    this.broadcastLog("published", "Published URL updated", { url: published });
+    return published;
+  }
+
+  private getPublishedUrl(): string | undefined {
+    const value = this.getConfigValue("publishedUrl");
+    return value?.trim() || undefined;
   }
 
   private async executeGate(gate: Gate, endpoint: string): Promise<void> {
