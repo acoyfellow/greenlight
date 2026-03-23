@@ -4,6 +4,9 @@
   "main": "src/index.ts",
   "compatibility_date": "2025-06-01",
   "compatibility_flags": ["nodejs_compat"],
+  "routes": [
+    { "pattern": "greenlight.coey.dev", "custom_domain": true }
+  ],
   "ai": { "binding": "AI" },
   "durable_objects": {
     "bindings": [

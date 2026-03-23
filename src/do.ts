@@ -1960,36 +1960,42 @@ export class GreenlightDO extends DurableObject<Env> {
   <style>
     :root { color-scheme: dark; }
     * { box-sizing: border-box; font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; }
-    body { margin: 0; background: #080d1c; color: #e6eeff; line-height: 1.45; }
-    main { max-width: 1080px; margin: 0 auto; padding: 30px 20px 40px; display: grid; gap: 18px; }
-    .card { background: #0f1730; border: 1px solid #263864; border-radius: 14px; padding: 20px; display: grid; gap: 12px; }
-    h1 { margin: 0; font-size: 34px; line-height: 1.15; }
-    h2 { margin: 0; font-size: 20px; line-height: 1.25; }
-    p { margin: 0; color: #b3c2eb; }
-    .eyebrow { color: #9ab0e6; font-size: 12px; letter-spacing: 0.08em; text-transform: uppercase; }
-    .lead { color: #cedafd; max-width: 760px; font-size: 16px; }
-    .muted { color: #94a9dc; font-size: 13px; }
+    body { margin: 0; background: #070b18; color: #e7eeff; line-height: 1.45; }
+    main { max-width: 1120px; margin: 0 auto; padding: 28px 18px 38px; display: grid; gap: 16px; }
+    .card { background: #0d1530; border: 1px solid #263d72; border-radius: 14px; padding: 18px; display: grid; gap: 12px; }
+    h1 { margin: 0; font-size: 36px; line-height: 1.08; letter-spacing: -0.01em; }
+    h2 { margin: 0; font-size: 20px; line-height: 1.2; }
+    h3 { margin: 0; font-size: 16px; line-height: 1.2; }
+    p { margin: 0; color: #b4c5ef; }
+    .eyebrow { color: #9cb4eb; font-size: 12px; letter-spacing: 0.08em; text-transform: uppercase; }
+    .lead { color: #d5e1ff; max-width: 780px; font-size: 16px; }
+    .muted { color: #93a8db; font-size: 13px; }
     .statusRow { display: flex; flex-wrap: wrap; gap: 8px; }
-    .chip { border: 1px solid #36508a; border-radius: 999px; padding: 5px 10px; font-size: 12px; background: #0b132a; }
-    .actionRow { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 4px; }
-    .progress { margin: 0; padding-left: 18px; color: #b7c9f6; display: grid; gap: 4px; }
+    .chip { border: 1px solid #375493; border-radius: 999px; padding: 5px 10px; font-size: 12px; background: #0a1228; }
+    .actionRow { display: flex; flex-wrap: wrap; gap: 10px; }
+    .heroPoints { margin: 0; padding-left: 18px; color: #bfd0f8; display: grid; gap: 4px; }
     .row { display: flex; align-items: center; justify-content: space-between; gap: 10px; flex-wrap: wrap; }
     .controls { display: flex; gap: 8px; flex-wrap: wrap; }
-    .split { display: grid; gap: 14px; grid-template-columns: 1fr 1fr; align-items: start; }
-    @media (max-width: 900px) { .split { grid-template-columns: 1fr; } }
+    .stage { display: grid; gap: 14px; grid-template-columns: 1.05fr 0.95fr; align-items: start; }
+    .stack { display: grid; gap: 12px; }
+    .split { display: grid; gap: 12px; grid-template-columns: 1fr 1fr; align-items: start; }
+    @media (max-width: 980px) {
+      .stage { grid-template-columns: 1fr; }
+      .split { grid-template-columns: 1fr; }
+    }
     form { display: flex; gap: 8px; flex-wrap: wrap; }
     input, select {
       flex: 1;
       min-width: 220px;
       border-radius: 10px;
-      border: 1px solid #365089;
-      background: #0a1430;
+      border: 1px solid #395898;
+      background: #08132d;
       color: #eef3ff;
       padding: 11px 12px;
     }
     button {
-      border: 1px solid #4868b2;
-      background: #1a316a;
+      border: 1px solid #4a70be;
+      background: #1a3775;
       color: #eef3ff;
       border-radius: 10px;
       padding: 10px 13px;
@@ -1997,14 +2003,14 @@ export class GreenlightDO extends DurableObject<Env> {
       font-weight: 600;
       line-height: 1.2;
     }
-    button:hover { background: #234187; }
+    button:hover { background: #244691; }
     button:disabled { opacity: 0.6; cursor: wait; }
     .gates, .runs, .templates { list-style: none; margin: 0; padding: 0; display: grid; gap: 8px; }
     .item {
-      border: 1px solid #2a3d6a;
+      border: 1px solid #2a4276;
       border-radius: 10px;
       padding: 10px;
-      background: #0c1735;
+      background: #0b1734;
       display: flex;
       gap: 10px;
       align-items: center;
@@ -2021,9 +2027,9 @@ export class GreenlightDO extends DurableObject<Env> {
       margin: 0;
       max-height: 270px;
       overflow: auto;
-      border: 1px solid #2a3d6a;
+      border: 1px solid #2a4276;
       border-radius: 10px;
-      background: #0a1430;
+      background: #08122a;
       padding: 10px;
     }
   </style>
@@ -2032,8 +2038,8 @@ export class GreenlightDO extends DurableObject<Env> {
   <main>
     <section class="card">
       <div class="eyebrow">greenlight</div>
-      <h1>Check your API. See red to green. Share proof.</h1>
-      <p class="lead">This page is a guided flow: add checks, run checks, then review what passed and failed.</p>
+      <h1>Set the rules. Let agents work. Verify they didn't break anything.</h1>
+      <p class="lead">Define what "correct" looks like in plain language. Greenlight watches your endpoints and gives you proof -- pass, fail, and why.</p>
       <div class="statusRow">
         <span id="projectLabel" class="chip">project: default</span>
         <span id="passRateChip" class="chip">pass 24h: 0%</span>
@@ -2041,82 +2047,88 @@ export class GreenlightDO extends DurableObject<Env> {
         <span id="streamState" class="chip">stream: connecting</span>
       </div>
       <div class="actionRow">
-        <button id="demoCtaBtn" type="button">Run guided demo</button>
+        <button id="demoCtaBtn" type="button">Try 60-second demo</button>
         <button id="proofBtn" type="button">Download proof JSON</button>
       </div>
-      <ol class="progress">
-        <li>Add one or more checks.</li>
-        <li>Run now or start the loop.</li>
-        <li>Watch failures turn green and export proof.</li>
-      </ol>
+      <ul class="heroPoints">
+        <li>Write rules, not test suites. Plain language checks, no setup tax.</li>
+        <li>Walk away from the keyboard. Start the loop and come back to green or red.</li>
+        <li>Get receipts, not dashboards. Export proof JSON with pass, fail, and when.</li>
+      </ul>
     </section>
 
-    <section class="card">
-      <h2>Step 1: Add checks and hints</h2>
-      <p class="muted">Write checks in plain language, for example: <span class="chip">GET /demo/health returns 200</span></p>
-      <form id="gateForm">
-        <input id="gateInput" placeholder="Add a check..." />
-        <button type="submit">Add check</button>
-      </form>
-      <form id="nudgeForm">
-        <input id="nudgeInput" placeholder="Add a short hint (optional)..." />
-        <button type="submit">Send hint</button>
-      </form>
-      <div class="split">
-        <section class="card" style="padding:14px;">
-          <div class="row">
-            <strong>Current checks</strong>
-            <span id="gateCount" class="chip">gates: 0</span>
+    <section class="stage">
+      <div class="stack">
+        <section class="card">
+          <h2>Step 1: Define rules</h2>
+          <p class="muted">Write a rule in plain language. Example: <span class="chip">GET /demo/health returns 200</span></p>
+          <form id="gateForm">
+            <input id="gateInput" placeholder="Example: GET /api/health returns 200" />
+            <button type="submit">Add rule</button>
+          </form>
+          <h3>Optional: give context</h3>
+          <form id="nudgeForm">
+            <input id="nudgeInput" placeholder="Example: auth token needs write scope" />
+            <button type="submit">Send hint</button>
+          </form>
+          <div class="split">
+            <section class="card" style="padding:14px;">
+              <div class="row">
+                <strong>Your rules</strong>
+                <span id="gateCount" class="chip">rules: 0</span>
+              </div>
+              <ul id="gatesList" class="gates"></ul>
+            </section>
+            <section class="card" style="padding:14px;">
+              <strong>Example rules</strong>
+              <ul id="templateList" class="templates"></ul>
+            </section>
           </div>
-          <ul id="gatesList" class="gates"></ul>
         </section>
-        <section class="card" style="padding:14px;">
-          <div class="row">
-            <strong>Quick templates</strong>
+
+        <section class="card">
+          <h2>Step 2: Run checks</h2>
+          <p class="muted">Run once with <strong>Run now</strong>. Keep verifying on a loop with <strong>Start</strong>.</p>
+          <div class="controls">
+            <button id="toggleLoopBtn" type="button">Start</button>
+            <button id="runNowBtn" type="button">Run now</button>
+            <button id="bootstrapDemoBtn" type="button">Load demo rules</button>
+            <button id="toggleDemoFailureBtn" type="button">Break demo endpoint</button>
           </div>
-          <ul id="templateList" class="templates"></ul>
+          <form id="apiKeyForm">
+            <input id="apiKeyInput" placeholder="Optional API key (x-api-key)" />
+            <button type="submit">Save key</button>
+          </form>
+          <div class="muted" id="authState">auth: unknown</div>
         </section>
       </div>
-    </section>
 
-    <section class="card">
-      <h2>Step 2: Run and control</h2>
-      <p class="muted">Use Run now for a single pass. Use Start for ongoing checks.</p>
-      <div class="row">
-        <div class="controls">
-          <button id="toggleLoopBtn" type="button">Start</button>
-          <button id="runNowBtn" type="button">Run now</button>
-          <button id="bootstrapDemoBtn" type="button">Bootstrap demo gates</button>
-          <button id="toggleDemoFailureBtn" type="button">Break demo endpoint</button>
-        </div>
-      </div>
-      <form id="apiKeyForm">
-        <input id="apiKeyInput" placeholder="Optional API key (x-api-key)" />
-        <button type="submit">Save key</button>
-      </form>
-      <div class="muted" id="authState">auth: unknown</div>
-    </section>
-
-    <section class="card">
-      <h2>Step 3: Review results</h2>
-      <div class="split">
-        <section class="card" style="padding:14px;">
-        <div class="row">
-          <strong>Recent runs</strong>
-          <span id="runCount" class="chip">0</span>
-        </div>
-        <ul id="runList" class="runs"></ul>
-        </section>
-        <section class="card" style="padding:14px;">
-        <strong>Reliability summary</strong>
-        <div id="sloPanel" class="mono"></div>
+      <div class="stack">
+        <section class="card">
+          <h2>Step 3: Verify results</h2>
+          <section class="card" style="padding:14px;">
+            <div class="row">
+              <strong>Recent runs</strong>
+              <span id="runCount" class="chip">0</span>
+            </div>
+            <ul id="runList" class="runs"></ul>
+          </section>
+          <section class="card" style="padding:14px;">
+            <strong>Reliability summary</strong>
+            <div id="sloPanel" class="mono"></div>
+          </section>
+          <section class="card" style="padding:14px;">
+            <strong>Proof JSON preview</strong>
+            <p class="muted">This is the kind of artifact you can export and share.</p>
+            <pre id="proofPreview" class="mono"></pre>
+          </section>
         </section>
       </div>
     </section>
 
     <section class="card">
       <h2>Live event log</h2>
-      <p class="muted">Shows loop events, gate changes, and auth actions in real time.</p>
+      <p class="muted">Live feed of rule checks, failures, recoveries, and proof events.</p>
       <pre id="logPanel" class="mono"></pre>
     </section>
   </main>
@@ -2156,6 +2168,7 @@ export class GreenlightDO extends DurableObject<Env> {
       const runList = $("runList");
       const runCount = $("runCount");
       const sloPanel = $("sloPanel");
+      const proofPreview = $("proofPreview");
       const logPanel = $("logPanel");
       const streamState = $("streamState");
       const projectLabel = $("projectLabel");
@@ -2221,7 +2234,7 @@ export class GreenlightDO extends DurableObject<Env> {
 
       const renderGates = () => {
         gatesList.innerHTML = "";
-        gateCount.textContent = "gates: " + state.gates.length;
+        gateCount.textContent = "rules: " + state.gates.length;
         for (const gate of state.gates) {
           const li = document.createElement("li");
           li.className = "item";
@@ -2284,6 +2297,18 @@ export class GreenlightDO extends DurableObject<Env> {
           "last run: " + (state.slo.lastRunAt || "never");
       };
 
+      const renderProofPreview = () => {
+        const failing = state.runs.filter(run => !run.pass).map(run => run.gate);
+        const preview = {
+          project: state.project,
+          pass_rate_24h: (state.slo ? state.slo.passRate24h : 0) + "%",
+          checks: state.gates.length,
+          last_run: state.slo?.lastRunAt || "never",
+          failures: failing,
+        };
+        proofPreview.textContent = JSON.stringify(preview, null, 2);
+      };
+
       const renderHeader = () => {
         passRateChip.textContent = "pass 24h: " + (state.slo ? state.slo.passRate24h : 0) + "%";
         proofFreshnessChip.textContent = "proof: " + relativeAge(state.lastProofAt);
@@ -2317,6 +2342,7 @@ export class GreenlightDO extends DurableObject<Env> {
         renderRuns();
         renderTemplates();
         renderSlo();
+        renderProofPreview();
 
         const existing = logsBody.result.logs || [];
         if (!logPanel.textContent) {
