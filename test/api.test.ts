@@ -67,7 +67,6 @@ describe("HTTP API", () => {
       const project = `fn-${Date.now()}`;
       const fn = `
 export default async (endpoint) => {
-  if (!endpoint) throw new Error("missing endpoint");
   const price = await fetch("data:application/json,%7B%22currency%22%3A%22USD%22%7D");
   if (price.status !== 200) throw new Error("price failed");
   const body = await price.json();
