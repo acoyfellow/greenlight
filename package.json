@@ -20,6 +20,7 @@
   ],
   "scripts": {
     "dev": "wrangler dev --port 8787 --local",
+    "deploy": "wrangler deploy",
     "typecheck": "tsc --noEmit",
     "lint": "oxlint src/ test/",
     "test": "vitest run",
