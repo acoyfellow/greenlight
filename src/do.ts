@@ -1020,12 +1020,15 @@ export class GreenlightDO extends DurableObject<Env> {
           }
         }
 
-        const response = await fetch(url, {
+        const init: RequestInit = {
           method,
           redirect,
           headers,
-          body: bodyValue,
-        });
+        };
+        if (bodyValue !== undefined && method !== "GET" && method !== "HEAD") {
+          init.body = bodyValue;
+        }
+        const response = await fetch(url, init);
         responses.set(varName, response);
         continue;
       }
@@ -1163,7 +1166,7 @@ export class GreenlightDO extends DurableObject<Env> {
       return text.slice(1, -1);
     }
     if (text.startsWith("`") && text.endsWith("`")) {
-      const inner = text.slice(1, -1);
+      const inner = text.slice(1, -1).replace(/\\\$\{/g, "${");
       return inner.replace(/\$\{([^}]+)\}/g, (_m, name: string) => {
         const key = name.trim();
         if (key === "endpoint") {
