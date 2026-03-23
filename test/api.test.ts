@@ -26,7 +26,8 @@ describe("HTTP API", () => {
       expect(res.status).toBe(200);
       const html = await res.text();
       expect(html).toContain("const pathParts = location.pathname.split(\"/\").filter(Boolean);");
-      expect(html).toContain("const projectPrefix = pathProject ? \"/p/\" + encodeURIComponent(pathProject) : \"\";");
+      expect(html).toContain("const pathProjectRaw = pathParts[0] === \"p\" && pathParts[1] ? pathParts[1] : \"\";");
+      expect(html).toContain("const projectPrefix = pathProjectRaw ? \"/p/\" + pathProjectRaw : \"\";");
       expect(html).toContain("const withPrefix = projectPrefix ? projectPrefix + normalized : normalized;");
     });
   });
@@ -388,6 +389,15 @@ export default async () => {
 
     it("resets gate iterations after a successful run", async () => {
       const project = `iterations-${Date.now()}`;
+      const fn = `
+export default async (endpoint) => {
+  const res = await fetch(endpoint);
+  const body = await res.json();
+  if (body.ok !== true) throw new Error("not ok");
+}
+      `.trim();
+      const failEndpoint = "data:application/json,%7B%22ok%22%3Afalse%7D";
+      const passEndpoint = "data:application/json,%7B%22ok%22%3Atrue%7D";
 
       await SELF.fetch(`http://localhost/config?project=${project}`, {
         method: "POST",
@@ -398,20 +408,20 @@ export default async () => {
       await SELF.fetch(`http://localhost/gates?project=${project}`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ assertion: "GET /demo/health returns 200" }),
+        body: JSON.stringify({ name: "iter-gate", fn }),
       });
 
       await SELF.fetch(`http://localhost/config?project=${project}`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ key: "targetEndpoint", value: "http://127.0.0.1:9999" }),
+        body: JSON.stringify({ key: "targetEndpoint", value: failEndpoint }),
       });
       await SELF.fetch(`http://localhost/run?project=${project}`, { method: "POST" });
 
       await SELF.fetch(`http://localhost/config?project=${project}`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ key: "targetEndpoint", value: "http://localhost" }),
+        body: JSON.stringify({ key: "targetEndpoint", value: passEndpoint }),
       });
       await SELF.fetch(`http://localhost/run?project=${project}`, { method: "POST" });
 
@@ -424,7 +434,7 @@ export default async () => {
       await SELF.fetch(`http://localhost/config?project=${project}`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ key: "targetEndpoint", value: "http://127.0.0.1:9999" }),
+        body: JSON.stringify({ key: "targetEndpoint", value: failEndpoint }),
       });
       await SELF.fetch(`http://localhost/run?project=${project}`, { method: "POST" });
 
@@ -590,6 +600,13 @@ export default async () => {
         body: JSON.stringify({ assertion: "GET /demo/health returns 200" }),
       });
       expect(blockedMutation.status).toBe(401);
+
+      const bootstrap = await SELF.fetch(`http://localhost/auth/bootstrap?project=${project}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ apiKey: "recover-key-1" }),
+      });
+      expect(bootstrap.status).toBe(200);
 
       const blockedBootstrap = await SELF.fetch(`http://localhost/auth/bootstrap?project=${project}`, {
         method: "POST",

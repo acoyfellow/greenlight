@@ -195,7 +195,10 @@ export class GreenlightDO extends DurableObject<Env> {
     });
 
     app.use("*", async (c, next) => {
-      if (["POST", "PUT", "PATCH", "DELETE"].includes(c.req.method)) {
+      const allowsBootstrapWithoutAuth = c.req.method === "POST"
+        && c.req.path === "/auth/bootstrap"
+        && !this.hasApiKeyAuthEnabled();
+      if (["POST", "PUT", "PATCH", "DELETE"].includes(c.req.method) && !allowsBootstrapWithoutAuth) {
         await this.requireMutationAccess(c.req.raw);
       }
       await next();
@@ -2122,10 +2125,11 @@ export class GreenlightDO extends DurableObject<Env> {
     (() => {
       const params = new URLSearchParams(location.search);
       const pathParts = location.pathname.split("/").filter(Boolean);
-      const pathProject = pathParts[0] === "p" && pathParts[1] ? decodeURIComponent(pathParts[1]) : "";
+      const pathProjectRaw = pathParts[0] === "p" && pathParts[1] ? pathParts[1] : "";
+      const pathProject = pathProjectRaw ? decodeURIComponent(pathProjectRaw) : "";
       const project = pathProject || params.get("project") || "default";
       const scopedSuffix = location.search ? (location.search.startsWith("?") ? location.search : "?" + location.search) : "";
-      const projectPrefix = pathProject ? "/p/" + encodeURIComponent(pathProject) : "";
+      const projectPrefix = pathProjectRaw ? "/p/" + pathProjectRaw : "";
 
       const state = {
         project,
