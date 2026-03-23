@@ -19,6 +19,17 @@ describe("HTTP API", () => {
       expect(html).toContain("id=\"logPanel\"");
       expect(html).toContain("id=\"toggleLoopBtn\"");
     });
+
+    it("keeps /p/<project> prefix when frontend builds API paths", async () => {
+      const project = `path-ui-${Date.now()}`;
+      const res = await SELF.fetch(`http://localhost/p/${project}/`);
+      expect(res.status).toBe(200);
+      const html = await res.text();
+      expect(html).toContain("const pathParts = location.pathname.split(\"/\").filter(Boolean);");
+      expect(html).toContain("const pathProjectRaw = pathParts[0] === \"p\" && pathParts[1] ? pathParts[1] : \"\";");
+      expect(html).toContain("const projectPrefix = pathProjectRaw ? \"/p/\" + pathProjectRaw : \"\";");
+      expect(html).toContain("const withPrefix = projectPrefix ? projectPrefix + normalized : normalized;");
+    });
   });
 
   describe("GET /stream", () => {
@@ -375,6 +386,64 @@ export default async () => {
       const proofBody = (await proof.json()) as Envelope<{ published?: string }>;
       expect(proofBody.result?.published).toBeTruthy();
     });
+
+    it("resets gate iterations after a successful run", async () => {
+      const project = `iterations-${Date.now()}`;
+      const fn = `
+export default async (endpoint) => {
+  const res = await fetch(endpoint);
+  const body = await res.json();
+  if (body.ok !== true) throw new Error("not ok");
+}
+      `.trim();
+      const failEndpoint = "data:application/json,%7B%22ok%22%3Afalse%7D";
+      const passEndpoint = "data:application/json,%7B%22ok%22%3Atrue%7D";
+
+      await SELF.fetch(`http://localhost/config?project=${project}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ key: "maxIterations", value: 3 }),
+      });
+
+      await SELF.fetch(`http://localhost/gates?project=${project}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ name: "iter-gate", fn }),
+      });
+
+      await SELF.fetch(`http://localhost/config?project=${project}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ key: "targetEndpoint", value: failEndpoint }),
+      });
+      await SELF.fetch(`http://localhost/run?project=${project}`, { method: "POST" });
+
+      await SELF.fetch(`http://localhost/config?project=${project}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ key: "targetEndpoint", value: passEndpoint }),
+      });
+      await SELF.fetch(`http://localhost/run?project=${project}`, { method: "POST" });
+
+      const afterPass = await SELF.fetch(`http://localhost/gates?project=${project}`);
+      const afterPassBody = (await afterPass.json()) as Envelope<{ gates: Gate[] }>;
+      const gateAfterPass = afterPassBody.result?.gates[0];
+      expect(gateAfterPass?.status).toBe("green");
+      expect(gateAfterPass?.iterations).toBe(0);
+
+      await SELF.fetch(`http://localhost/config?project=${project}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ key: "targetEndpoint", value: failEndpoint }),
+      });
+      await SELF.fetch(`http://localhost/run?project=${project}`, { method: "POST" });
+
+      const afterFail = await SELF.fetch(`http://localhost/gates?project=${project}`);
+      const afterFailBody = (await afterFail.json()) as Envelope<{ gates: Gate[] }>;
+      const gateAfterFail = afterFailBody.result?.gates[0];
+      expect(gateAfterFail?.status).toBe("red");
+      expect(gateAfterFail?.iterations).toBe(1);
+    });
   });
 
   describe("api key auth", () => {
@@ -458,6 +527,49 @@ export default async () => {
       });
       expect(withRevoked.status).toBe(403);
     });
+
+    it("revokes previous primary key on rotate", async () => {
+      const project = `auth-rotate-${Date.now()}`;
+      const oldKey = "old-primary-key";
+      const newKey = "new-primary-key";
+
+      const bootstrap = await SELF.fetch(`http://localhost/auth/bootstrap?project=${project}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ apiKey: oldKey }),
+      });
+      expect(bootstrap.status).toBe(200);
+
+      const rotate = await SELF.fetch(`http://localhost/auth/rotate?project=${project}`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "x-api-key": oldKey,
+        },
+        body: JSON.stringify({ apiKey: newKey }),
+      });
+      expect(rotate.status).toBe(200);
+
+      const oldKeyWrite = await SELF.fetch(`http://localhost/gates?project=${project}`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "x-api-key": oldKey,
+        },
+        body: JSON.stringify({ assertion: "GET /demo/health returns 200" }),
+      });
+      expect(oldKeyWrite.status).toBe(403);
+
+      const newKeyWrite = await SELF.fetch(`http://localhost/gates?project=${project}`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "x-api-key": newKey,
+        },
+        body: JSON.stringify({ assertion: "GET /demo/health returns 200" }),
+      });
+      expect(newKeyWrite.status).toBe(200);
+    });
   });
 
   describe("jwt auth config", () => {
@@ -488,6 +600,18 @@ export default async () => {
         body: JSON.stringify({ assertion: "GET /demo/health returns 200" }),
       });
       expect(blockedMutation.status).toBe(401);
+
+      const bootstrap = await SELF.fetch(`http://localhost/auth/bootstrap?project=${project}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ apiKey: "recover-key-1" }),
+      });
+      expect(bootstrap.status).toBe(200);
+
+      const blockedBootstrap = await SELF.fetch(`http://localhost/auth/bootstrap?project=${project}`, {
+        method: "POST",
+      });
+      expect(blockedBootstrap.status).toBe(401);
     });
   });
 });

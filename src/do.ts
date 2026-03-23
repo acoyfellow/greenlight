@@ -195,7 +195,10 @@ export class GreenlightDO extends DurableObject<Env> {
     });
 
     app.use("*", async (c, next) => {
-      if (["POST", "PUT", "PATCH", "DELETE"].includes(c.req.method) && c.req.path !== "/auth/bootstrap") {
+      const allowsBootstrapWithoutAuth = c.req.method === "POST"
+        && c.req.path === "/auth/bootstrap"
+        && !this.hasApiKeyAuthEnabled();
+      if (["POST", "PUT", "PATCH", "DELETE"].includes(c.req.method) && !allowsBootstrapWithoutAuth) {
         await this.requireMutationAccess(c.req.raw);
       }
       await next();
@@ -289,13 +292,22 @@ export class GreenlightDO extends DurableObject<Env> {
 
       const provided = String(json.apiKey ?? "").trim();
       const apiKey = provided || this.generateApiToken();
+      const previousPrimaryHash = this.getConfigValue("apiKeyHash");
       const token = await this.createAuthToken(`rotated-${Date.now()}`, "admin", apiKey);
       this.setConfigValue("apiKeyHash", token.hash);
-      this.broadcastLog("auth_rotated", "Primary API key rotated", { tokenId: token.id });
+      let revokedTokenId: number | undefined;
+      if (previousPrimaryHash && previousPrimaryHash !== token.hash) {
+        revokedTokenId = this.revokeAuthTokenByHash(previousPrimaryHash);
+      }
+      this.broadcastLog("auth_rotated", "Primary API key rotated", {
+        tokenId: token.id,
+        revokedTokenId,
+      });
       return json200(envelope(command, true, {
         rotated: true,
         apiKey,
         token: { id: token.id, name: token.name, scope: token.scope },
+        revokedTokenId,
       }));
     });
 
@@ -738,7 +750,7 @@ export class GreenlightDO extends DurableObject<Env> {
       }
 
       const durationMs = Date.now() - started;
-      const attempts = gate.iterations + 1;
+      const attempts = pass ? 0 : gate.iterations + 1;
       const nextStatus: Gate["status"] = pass
         ? "green"
         : (attempts >= config.maxIterations ? "stuck" : "red");
@@ -1761,6 +1773,19 @@ export class GreenlightDO extends DurableObject<Env> {
     return true;
   }
 
+  private revokeAuthTokenByHash(hash: string): number | undefined {
+    const row = [...this.sql.exec(
+      `SELECT id FROM auth_tokens WHERE token_hash = ? AND revoked_at IS NULL LIMIT 1`,
+      hash
+    )][0];
+    if (!row) {
+      return undefined;
+    }
+    const id = row.id as number;
+    this.sql.exec(`UPDATE auth_tokens SET revoked_at = ? WHERE id = ?`, new Date().toISOString(), id);
+    return id;
+  }
+
   private touchAuthToken(id: number): void {
     this.sql.exec(`UPDATE auth_tokens SET last_used_at = ? WHERE id = ?`, new Date().toISOString(), id);
   }
@@ -2099,8 +2124,12 @@ export class GreenlightDO extends DurableObject<Env> {
   <script>
     (() => {
       const params = new URLSearchParams(location.search);
-      const project = params.get("project") || "default";
+      const pathParts = location.pathname.split("/").filter(Boolean);
+      const pathProjectRaw = pathParts[0] === "p" && pathParts[1] ? pathParts[1] : "";
+      const pathProject = pathProjectRaw ? decodeURIComponent(pathProjectRaw) : "";
+      const project = pathProject || params.get("project") || "default";
       const scopedSuffix = location.search ? (location.search.startsWith("?") ? location.search : "?" + location.search) : "";
+      const projectPrefix = pathProjectRaw ? "/p/" + pathProjectRaw : "";
 
       const state = {
         project,
@@ -2144,7 +2173,11 @@ export class GreenlightDO extends DurableObject<Env> {
       apiKeyInput.value = state.apiKey;
       projectLabel.textContent = "project: " + state.project;
 
-      const scopedPath = (path) => path + (scopedSuffix ? (path.includes("?") ? "&" : "?") + scopedSuffix.slice(1) : "");
+      const scopedPath = (path) => {
+        const normalized = path.startsWith("/") ? path : "/" + path;
+        const withPrefix = projectPrefix ? projectPrefix + normalized : normalized;
+        return withPrefix + (scopedSuffix ? (withPrefix.includes("?") ? "&" : "?") + scopedSuffix.slice(1) : "");
+      };
 
       const authHeaders = (contentType) => {
         const headers = {};
